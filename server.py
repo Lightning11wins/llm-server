@@ -172,13 +172,14 @@ async def ensure_loaded(name: str, ttl: float) -> None:
         model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
 
         # Register and log.
+        t1 = time.time()
         models[name] = {
             "model": model,
             "tokenizer": tok,
             "lock": asyncio.Lock(),
-            "ttl_end": time.time() + ttl,
+            "ttl_end": t1 + ttl,
         }
-        log.info(f"Model loaded: {name}  ({time.time() - t0:.1f}s)")
+        log.info(f"Model loaded: {name}  ({t1 - t0:.1f}s)")
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 # Return all available models; filter by loaded=true|false|any.
@@ -234,6 +235,7 @@ async def run(req: RunReq) -> StreamingResponse:
             raise HTTPException(500, "Internal server error")
         raise
 
+    # Resolve defaults and get entry.
     ttl = req.ttl if req.ttl is not None else DEFAULT_TTL
     entry = models[req.model]
 
