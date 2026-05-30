@@ -78,22 +78,32 @@ print(json.dumps(d))
       -H "Accept: text/event-stream" \
       -d "$BODY" | python3 -c "
 import sys, json
+buf = []
 for line in sys.stdin:
     line = line.rstrip('\n')
-    if not line.startswith('data: '):
-        continue
-    data = line[6:]
-    if data == '[DONE]':
-        print()
-        break
+    if line.startswith('data: '):
+        buf = None
+        data = line[6:]
+        if data == '[DONE]':
+            print()
+            break
+        try:
+            d = json.loads(data)
+            if 'token' in d:
+                print(d['token'], end='', flush=True)
+            elif 'error' in d:
+                print('\nError: ' + d['error'], file=sys.stderr)
+        except json.JSONDecodeError:
+            pass
+    elif buf is not None and line.strip():
+        buf.append(line)
+if buf:
+    raw = ' '.join(buf)
     try:
-        d = json.loads(data)
-        if 'token' in d:
-            print(d['token'], end='', flush=True)
-        elif 'error' in d:
-            print('\nError: ' + d['error'], file=sys.stderr)
+        print('Error: ' + json.loads(raw).get('error', raw), file=sys.stderr)
     except json.JSONDecodeError:
-        pass
+        print('Error: ' + raw, file=sys.stderr)
+    sys.exit(1)
 "
     ;;
 
