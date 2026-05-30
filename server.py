@@ -5,6 +5,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, TypedDict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -53,9 +54,14 @@ hf_logging.set_verbosity_error()
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 # ── Model registry ─────────────────────────────────────────────────────────────
-# {name: {"model": ..., "tokenizer": ..., "lock": asyncio.Lock, "ttl_end": float}}
-models: dict = {}
-load_lock = asyncio.Lock()  # serialises concurrent load operations for the same model
+class ModelEntry(TypedDict):
+    model: Any
+    tokenizer: Any
+    lock: asyncio.Lock
+    ttl_end: float
+
+models: dict[str, ModelEntry] = {}
+load_lock = asyncio.Lock()  # serializes all model loading
 
 
 async def ttl_monitor():
@@ -113,23 +119,27 @@ class RunReq(BaseModel):
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def require_exists(name: str) -> None:
+def validate_model(name: str) -> None:
     if "/" in name or ".." in Path(name).parts:
         raise HTTPException(400, f"Invalid model name: '{name}'")
     if not (MODELS_DIR / name).exists():
         raise HTTPException(404, f"Model '{name}' not found in models/")
 
 
+def _refresh_ttl(entry: ModelEntry, ttl: float) -> None:
+    entry["ttl_end"] = time.time() + max(entry["ttl_end"] - time.time(), ttl)
+
+
 async def ensure_loaded(name: str, ttl: float):
     if name in models:
         e = models[name]
-        e["ttl_end"] = time.time() + max(e["ttl_end"] - time.time(), ttl)
+        _refresh_ttl(e, ttl)
         return
 
     async with load_lock:
         if name in models:  # second check after acquiring lock
             e = models[name]
-            e["ttl_end"] = time.time() + max(e["ttl_end"] - time.time(), ttl)
+            _refresh_ttl(e, ttl)
             return
 
         path = str(MODELS_DIR / name)
@@ -163,7 +173,7 @@ async def list_models(loaded: str = "any"):
 async def load(req: LoadReq):
     log.info(f"Request received: POST /load  model={req.model}")
     try:
-        require_exists(req.model)
+        validate_model(req.model)
         await ensure_loaded(req.model, req.ttl)
     except Exception as e:
         log.error(f"Request failed: POST /load  model={req.model}  {type(e).__name__}: {e}")
@@ -176,7 +186,7 @@ async def load(req: LoadReq):
 async def run(req: RunReq):
     log.info(f"Request received: POST /run  model={req.model}")
     try:
-        require_exists(req.model)
+        validate_model(req.model)
         if req.autoload:
             if req.ttl is None:
                 raise HTTPException(400, "ttl is required when autoload=true")
@@ -192,6 +202,7 @@ async def run(req: RunReq):
 
     async def stream():
         async with entry["lock"]:
+            token_count = 0
             try:
                 m, tok = entry["model"], entry["tokenizer"]
                 inputs   = tok(req.prompt, return_tensors="pt").to(m.device)
@@ -204,7 +215,6 @@ async def run(req: RunReq):
                     daemon=True,
                 )
                 thread.start()
-                token_count = 0
                 loop = asyncio.get_running_loop()
                 while True:
                     token = await loop.run_in_executor(None, lambda: next(streamer, None))
@@ -212,12 +222,13 @@ async def run(req: RunReq):
                         break
                     token_count += 1
                     yield f"data: {json.dumps({'token': token})}\n\n"
-                entry["ttl_end"] = time.time() + max(entry["ttl_end"] - time.time(), ttl)
                 log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 log.error(f"Inference error ({req.model}): {e}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally:
+                _refresh_ttl(entry, ttl)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
