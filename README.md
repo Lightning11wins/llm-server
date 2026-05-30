@@ -20,7 +20,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA 12
 python3 server.py
 ```
 
-Default port: `8080`. Change `PORT` at the top of `server.py`.
+Default port: `8080`. Change `PORT` at the top of `server.py`. Logs are written to `logs/<timestamp>.log`.
 
 ## API
 

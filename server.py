@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from transformers import logging as hf_logging
@@ -22,10 +23,11 @@ DEFAULT_TEMPERATURE     = 1.0
 DEFAULT_TOP_P           = 1.0
 DEFAULT_REPETITION_PENALTY = 1.0
 
-MODELS_DIR = Path("models")
+BASE_DIR   = Path(__file__).parent
+MODELS_DIR = BASE_DIR / "models"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-_log_dir = Path("logs")
+_log_dir = BASE_DIR / "logs"
 _log_dir.mkdir(exist_ok=True)
 _log_file = _log_dir / f"{time.strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
@@ -40,10 +42,6 @@ log.setLevel(logging.INFO)
 log.addHandler(_fh)
 log.addHandler(_ch)
 log.propagate = False  # prevent double-printing via root logger
-
-# Write uvicorn access/error logs to our file as well
-for _n in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-    logging.getLogger(_n).addHandler(_fh)
 
 # Silence noisy library output (progress bars, pad_token warnings, etc.)
 hf_logging.set_verbosity_error()
@@ -66,6 +64,8 @@ async def ttl_monitor():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    for _n in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        logging.getLogger(_n).addHandler(_fh)
     log.info("Server started")
     asyncio.create_task(ttl_monitor())
     yield
@@ -73,6 +73,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(HTTPException)
+async def http_exc_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exc_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"error": str(exc)})
+
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
 class LoadReq(BaseModel):
