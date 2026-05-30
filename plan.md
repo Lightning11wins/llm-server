@@ -161,11 +161,14 @@ Interface: subcommand + named flags.
 ```bash
 ./llm.sh list [--loaded true|false|any]
 ./llm.sh load --model <name> [--ttl <seconds>]
-./llm.sh run  --model <name> --prompt <text> [--autoload --ttl <s>] [--max-tokens <n>] [--temperature <f>]
+./llm.sh run  --model <name> --prompt <text> [--autoload --ttl <s>] [--max-tokens <n>] [--temperature <f>] [--top-p <f>] [--repetition-penalty <f>]
 ```
 
 For `run`, tokens are printed to stdout as they arrive (using `curl --no-buffer` to consume the SSE stream live).
 
 ## README.md
 
-Short, concise, intended for coding agents integrating with this server. Covers: how to start the server, full API reference with example requests and responses, and `llm.sh` usage. Trim any filler — make every word count.
+Short, concise, intended for coding agents integrating with this server. Covers: how to start the server (`python3 server.py`), full API reference with example requests and responses, and `llm.sh` usage. Trim any filler — make every word count.
+
+Include a **TODO** section at the end for planned but unimplemented features:
+- Chat template support (`tokenizer.apply_chat_template()`) for instruction-tuned models
