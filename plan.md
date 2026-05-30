@@ -1,50 +1,142 @@
-# Design Prompt
-I would like to write a project called LLM server that serves local LLMs over a port for use in other apps and projects on my computer. It will implement a basic API described below, including response streaming and model loading and unloading. I want the simplest, most concise implementation you can manage. The less code the better, large amounts of code are hard to read, understand, and maintain.
+# LLM Server — Design Plan
 
-The project will use the following structure (in addition to the git files, as this is a git repo):
-```md
+A local LLM server that serves HuggingFace models over HTTP for use by other apps and scripts on the same machine. Priority: simplest, most concise implementation possible — the less code the better; large amounts of code are hard to read, understand, and maintain.
+
+## File Structure
+
+```
 llm-server/
-- models/
-- server.py
-- server.log
-- llm.sh
-- README.md
-- plan.md (this file, will not be in the final project)
+├── models/          # HuggingFace model subdirectories
+├── server.py        # Main server
+├── server.log       # Runtime log (generated)
+├── llm.sh           # CLI testing script
+├── README.md        # Agent-readable API reference
+└── plan.md          # This file (not in final project)
 ```
 
-## models/
-A sub-directory in the project that holds available model weight files.
+## Stack
+
+- **Runtime:** Python, FastAPI + uvicorn
+- **Inference:** HuggingFace `transformers` + `torch` (CUDA via `device_map="auto"`)
+- **Streaming:** `TextIteratorStreamer` (background thread) → FastAPI `StreamingResponse`
 
 ## server.py
-The main source code for the project, which does the following:
-- Starts the server to listen on a port specified at the top of the file.
-- Allows models to be loaded into ram, after which they are automatically unloaded when their ttl expires.
-  - If multiple requests are made to the same model, the ttl should be updated each time to the highest ttl received. e.g. A load request loads a model with a ttl of 30. 20 seconds later (the ttl is now 10), a run request with a ttl of 15 arrives. After the request, the ttl is set to 15 because the request had a larger ttl than the remaining value.
-- Allows streaming inference from loaded models, which are managed using a python library.
-- Implements an API that responds to requests using the following types and parameters:
-  - **list**: Lists all available LLM models, both loaded and not loaded.
-    - **loaded** (optional): specify true (list only loaded models), false (list only unloaded models), or any (default, list all models).
-  - **load**: Loads a model into ram so that it is ready for use.
-    - **model** (required): specifies the model name, in the same format given by the list request.
-    - **ttl** (optional): The amount of time, in seconds, that the model should remain loaded after the request finishes. The default should be specified in a variable at the top of this file. Set it to 300s for now.
-  - **run**: Runs a model with the given prompt and streams the response back over the API to the requesting client.
-    - **prompt** (required): specifies the text prompt that the model will respond to.
-    - **model** (required): Same as load request.
-    - **ttl** (optional): Same as load request.
-    - **autoload** (optional): true if an unloaded model should be loaded for the request. If false (the default), the request returns an error if the model is not loaded.
 
-## server.log
-A plain text debug and analytics log file that records important events, including the following events listed below. All logs should include a date-time stamp.
-- Server start
-- Server stop
-- Request received
-- Request completed
-- Model loaded
-- Model unloaded
+### Constants (top of file)
+
+```python
+PORT = 8080
+DEFAULT_TTL = 300           # seconds
+DEFAULT_MAX_TOKENS = 512
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 1.0
+DEFAULT_REPETITION_PENALTY = 1.0
+```
+
+### Model Storage
+
+Models are HuggingFace-format subdirectories inside `models/`. The model name used in API requests is the directory name (e.g. `llama-3` → `models/llama-3/`).
+
+### Model Lifecycle
+
+- Models are loaded with `AutoModelForCausalLM` + `AutoTokenizer`, `device_map="auto"` (auto GPU allocation).
+- Each loaded model has a TTL countdown. After the TTL expires with no activity, the model is unloaded from memory.
+- TTL rule: after each request completes, TTL is set to `max(time_remaining, request_ttl)`. Example: model loaded with ttl=30; 20s later (10s remaining) a run request arrives with ttl=15; after the request, TTL is set to 15 because 15 > 10.
+- A model is never unloaded while inference is actively running.
+- The `load` endpoint blocks until the model is fully in memory before responding. If the model is already loaded, refresh its TTL and return success immediately.
+
+### Concurrency
+
+- Each model has its own `asyncio.Lock`. Requests for the same model are queued; only one runs at a time.
+- Requests for **different** models run in parallel (each holds its own lock independently).
+
+### API
+
+All request bodies are JSON. All responses are JSON except `/run`, which is SSE.
+
+#### `GET /list`
+
+Query params:
+- `loaded` (optional): `true` | `false` | `any` (default: `any`)
+
+Response:
+```json
+[{"name": "llama-3", "loaded": true}, ...]
+```
+
+#### `POST /load`
+
+Body:
+```json
+{"model": "llama-3", "ttl": 300}
+```
+
+Blocks until fully loaded. Response:
+```json
+{"status": "loaded", "model": "llama-3"}
+```
+
+#### `POST /run`
+
+Body:
+```json
+{
+  "model": "llama-3",
+  "prompt": "Hello, world",
+  "ttl": 300,
+  "autoload": false,
+  "max_tokens": 512,
+  "temperature": 1.0,
+  "top_p": 1.0,
+  "repetition_penalty": 1.0
+}
+```
+
+Required: `model`, `prompt`. If `autoload` is true, `ttl` is also required. Returns `text/event-stream` (SSE):
+```
+data: {"token": "Hello"}
+data: {"token": " there"}
+...
+data: [DONE]
+```
+
+If an error occurs after streaming has begun, send `data: {"error": "..."}` then close the stream.
+
+#### Error responses (non-streaming)
+
+| Condition | Status |
+|-----------|--------|
+| Model name not found in `models/` | 404 |
+| Model exists but is not loaded (`autoload=false`) | 400 |
+| Server/inference error | 500 |
+
+```json
+{"error": "description of what went wrong"}
+```
+
+### Logging (server.log)
+
+Plain text, one event per line, always with a datetime stamp. Logged events:
+- Server start / stop
+- Request received (method + endpoint)
+- Request completed (duration)
+- Model loaded / unloaded
 - Any other important events
 
 ## llm.sh
-A simple script that allows requests to be sent programmaticly from a command line, primarily intended for testing purposes. This should allow all the requests, as well as their parameters, to be specified and should handle receiving and displaying the responses (e.g. printing the streamed tokens as they arrive from a run request, listing models, etc.). It should use the API and send requests over the port. It should not call the server directly.
 
-## readme.md
-A simple, concise doc file explaining how to use this project and especially how to interact with the API. This is intended to be read by coding agents, who are attempting to build with this project, so it should be as short as possible. Provide the necessary context and trim any filler, make every word count for this file.
+Bash script. Sends requests to the server over HTTP; does not invoke `server.py` directly.
+
+Interface: subcommand + named flags.
+
+```bash
+./llm.sh list [--loaded true|false|any]
+./llm.sh load --model <name> [--ttl <seconds>]
+./llm.sh run  --model <name> --prompt <text> [--autoload --ttl <s>] [--max-tokens <n>] [--temperature <f>]
+```
+
+For `run`, tokens are printed to stdout as they arrive (using `curl --no-buffer` to consume the SSE stream live).
+
+## README.md
+
+Short, concise, intended for coding agents integrating with this server. Covers: how to start the server, full API reference with example requests and responses, and `llm.sh` usage. Trim any filler — make every word count.
