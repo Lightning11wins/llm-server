@@ -84,3 +84,14 @@ On mid-stream error: `data: {"error": "..."}` then stream closes.
 ## TODO
 
 - Chat template support (`tokenizer.apply_chat_template()`) for instruction-tuned models
+
+## Developer Notes
+
+- **`torch` is not in `requirements.txt`** — it must be installed separately with a CUDA-version-specific index URL. See Setup above.
+- **Models must be HuggingFace-format directories** — each model directory needs `config.json`, tokenizer files, and weight files. Single `.safetensors` or `.bin` files alone won't work.
+- **Instruction-tuned models produce poor output without chat templates** — the server sends raw prompts directly to the tokenizer. Until chat template support is added (see TODO), base/completion models work best.
+- **`do_sample=True` is always set** — generation is always stochastic. Deterministic/greedy output is not available via the API.
+- **`device_map="auto"` silently spills to CPU** — if a model exceeds available VRAM, layers overflow to system RAM with no error or warning, making inference much slower.
+- **Model loading is serialized** — only one model loads at a time. Concurrent load requests for different models queue behind each other.
+- **Per-model inference queue** — concurrent requests to the same model are queued; requests to different loaded models run in parallel.
+- **TTL expiry has up to 5s lag** — the TTL monitor polls every 5 seconds, so models may stay loaded slightly past their TTL.
