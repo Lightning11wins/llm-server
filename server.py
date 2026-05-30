@@ -5,7 +5,6 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -29,7 +28,13 @@ MODELS_DIR = BASE_DIR / "models"
 # ── Logging ────────────────────────────────────────────────────────────────────
 _log_dir = BASE_DIR / "logs"
 _log_dir.mkdir(exist_ok=True)
-_log_file = _log_dir / f"{time.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+_ts = time.strftime('%Y-%m-%d_%H-%M-%S')
+_log_file = _log_dir / f"{_ts}.log"
+if _log_file.exists():
+    _sfx = 2
+    while (_log_dir / f"{_ts}-{_sfx}.log").exists():
+        _sfx += 1
+    _log_file = _log_dir / f"{_ts}-{_sfx}.log"
 
 _fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 _fh  = logging.FileHandler(_log_file)
@@ -85,6 +90,12 @@ async def validation_exc_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"error": str(exc)})
 
 
+@app.exception_handler(Exception)
+async def generic_exc_handler(request: Request, exc: Exception):
+    log.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
+    return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+
 # ── Schemas ────────────────────────────────────────────────────────────────────
 class LoadReq(BaseModel):
     model: str
@@ -94,7 +105,7 @@ class LoadReq(BaseModel):
 class RunReq(BaseModel):
     model: str
     prompt: str
-    ttl: Optional[float] = None
+    ttl: float | None = None
     autoload: bool = False
     max_tokens: int = DEFAULT_MAX_TOKENS
     temperature: float = DEFAULT_TEMPERATURE
@@ -103,7 +114,7 @@ class RunReq(BaseModel):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def require_exists(name: str) -> None:
-    if ".." in name or "/" in name:
+    if "/" in name or ".." in Path(name).parts:
         raise HTTPException(400, f"Invalid model name: '{name}'")
     if not (MODELS_DIR / name).exists():
         raise HTTPException(404, f"Model '{name}' not found in models/")
@@ -125,12 +136,16 @@ async def ensure_loaded(name: str, ttl: float):
         log.info(f"Model loading: {name}")
         t0   = time.time()
         loop = asyncio.get_running_loop()
-        tok   = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
-        if tok.pad_token_id is None:
-            tok.pad_token_id = tok.eos_token_id
-        model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
-        models[name] = {"model": model, "tokenizer": tok, "lock": asyncio.Lock(), "ttl_end": time.time() + ttl}
-        log.info(f"Model loaded: {name}  ({time.time() - t0:.1f}s)")
+        try:
+            tok   = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
+            if tok.pad_token_id is None:
+                tok.pad_token_id = tok.eos_token_id
+            model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
+            models[name] = {"model": model, "tokenizer": tok, "lock": asyncio.Lock(), "ttl_end": time.time() + ttl}
+            log.info(f"Model loaded: {name}  ({time.time() - t0:.1f}s)")
+        except Exception as e:
+            log.error(f"Failed to load model '{name}': {e}")
+            raise
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/list")
@@ -147,8 +162,12 @@ async def list_models(loaded: str = "any"):
 @app.post("/load")
 async def load(req: LoadReq):
     log.info(f"Request received: POST /load  model={req.model}")
-    require_exists(req.model)
-    await ensure_loaded(req.model, req.ttl)
+    try:
+        require_exists(req.model)
+        await ensure_loaded(req.model, req.ttl)
+    except Exception as e:
+        log.error(f"Request failed: POST /load  model={req.model}  {type(e).__name__}: {e}")
+        raise
     log.info(f"Request completed: POST /load  model={req.model}")
     return {"status": "loaded", "model": req.model}
 
@@ -156,14 +175,17 @@ async def load(req: LoadReq):
 @app.post("/run")
 async def run(req: RunReq):
     log.info(f"Request received: POST /run  model={req.model}")
-    require_exists(req.model)
-
-    if req.autoload:
-        if req.ttl is None:
-            raise HTTPException(400, "ttl is required when autoload=true")
-        await ensure_loaded(req.model, req.ttl)
-    elif req.model not in models:
-        raise HTTPException(400, f"Model '{req.model}' is not loaded")
+    try:
+        require_exists(req.model)
+        if req.autoload:
+            if req.ttl is None:
+                raise HTTPException(400, "ttl is required when autoload=true")
+            await ensure_loaded(req.model, req.ttl)
+        elif req.model not in models:
+            raise HTTPException(400, f"Model '{req.model}' is not loaded")
+    except Exception as e:
+        log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")
+        raise
 
     ttl   = req.ttl if req.ttl is not None else DEFAULT_TTL
     entry = models[req.model]
