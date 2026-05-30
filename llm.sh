@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PORT=8080
 BASE="http://localhost:$PORT"
 
@@ -76,35 +77,7 @@ print(json.dumps(d))
     curl -sN -X POST "$BASE/run" \
       -H "Content-Type: application/json" \
       -H "Accept: text/event-stream" \
-      -d "$BODY" | python3 -c "
-import sys, json
-buf = []
-for line in sys.stdin:
-    line = line.rstrip('\n')
-    if line.startswith('data: '):
-        buf = None
-        data = line[6:]
-        if data == '[DONE]':
-            print()
-            break
-        try:
-            d = json.loads(data)
-            if 'token' in d:
-                print(d['token'], end='', flush=True)
-            elif 'error' in d:
-                print('\nError: ' + d['error'], file=sys.stderr)
-        except json.JSONDecodeError:
-            pass
-    elif buf is not None and line.strip():
-        buf.append(line)
-if buf:
-    raw = ' '.join(buf)
-    try:
-        print('Error: ' + json.loads(raw).get('error', raw), file=sys.stderr)
-    except json.JSONDecodeError:
-        print('Error: ' + raw, file=sys.stderr)
-    sys.exit(1)
-"
+      -d "$BODY" | python3 "$SCRIPT_DIR/_llm_stream.py"
     ;;
 
   *)
