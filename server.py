@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import logging as hf_logging
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 PORT                    = 8080
@@ -24,13 +25,20 @@ DEFAULT_REPETITION_PENALTY = 1.0
 MODELS_DIR = Path("models")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    filename="server.log",
-    level=logging.INFO,
-    format="%(asctime)s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+_handler = logging.FileHandler("server.log")
+_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+log.addHandler(_handler)
+
+# Write uvicorn access/error logs to our file as well
+for _n in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+    logging.getLogger(_n).addHandler(_handler)
+
+# Silence noisy library output (progress bars, pad_token warnings, etc.)
+hf_logging.set_verbosity_error()
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 # ── Model registry ─────────────────────────────────────────────────────────────
 # {name: {"model": ..., "tokenizer": ..., "lock": asyncio.Lock, "ttl_end": float}}
@@ -97,6 +105,8 @@ async def ensure_loaded(name: str, ttl: float):
         log.info(f"Model loading: {name}")
         loop = asyncio.get_running_loop()
         tok   = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
+        if tok.pad_token_id is None:
+            tok.pad_token_id = tok.eos_token_id
         model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
         models[name] = {"model": model, "tokenizer": tok, "lock": asyncio.Lock(), "ttl_end": time.time() + ttl}
         log.info(f"Model loaded: {name}")
@@ -104,10 +114,12 @@ async def ensure_loaded(name: str, ttl: float):
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/list")
 async def list_models(loaded: str = "any"):
+    log.info(f"Request received: GET /list  loaded={loaded}")
     names = sorted(p.name for p in MODELS_DIR.iterdir() if p.is_dir()) if MODELS_DIR.exists() else []
     result = [{"name": n, "loaded": n in models} for n in names]
-    if loaded == "true":  return [r for r in result if     r["loaded"]]
-    if loaded == "false": return [r for r in result if not r["loaded"]]
+    if loaded == "true":  result = [r for r in result if     r["loaded"]]
+    if loaded == "false": result = [r for r in result if not r["loaded"]]
+    log.info(f"Request completed: GET /list  returned={len(result)}")
     return result
 
 
@@ -148,12 +160,14 @@ async def run(req: RunReq):
                                 repetition_penalty=req.repetition_penalty, do_sample=True),
                 )
                 thread.start()
+                token_count = 0
                 for token in streamer:
+                    token_count += 1
                     yield f"data: {json.dumps({'token': token})}\n\n"
                 thread.join()
                 entry["ttl_end"] = time.time() + max(entry["ttl_end"] - time.time(), ttl)
+                log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
                 yield "data: [DONE]\n\n"
-                log.info(f"Request completed: POST /run  model={req.model}")
             except Exception as e:
                 log.error(f"Inference error ({req.model}): {e}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
