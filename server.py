@@ -5,14 +5,14 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import TypedDict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, TextIteratorStreamer
 from transformers import logging as hf_logging
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -55,8 +55,8 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 # ── Model registry ─────────────────────────────────────────────────────────────
 class ModelEntry(TypedDict):
-    model: Any
-    tokenizer: Any
+    model: PreTrainedModel
+    tokenizer: PreTrainedTokenizerBase
     lock: asyncio.Lock
     ttl_end: float
 
@@ -64,7 +64,7 @@ models: dict[str, ModelEntry] = {}
 load_lock = asyncio.Lock()  # serializes all model loading
 
 
-async def ttl_monitor():
+async def ttl_monitor() -> None:
     while True:
         await asyncio.sleep(5)
         now = time.time()
@@ -87,22 +87,27 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
-async def http_exc_handler(request: Request, exc: HTTPException):
+async def http_exc_handler(request: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_exc_handler(request: Request, exc: RequestValidationError):
+async def validation_exc_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"error": str(exc)})
 
 
 @app.exception_handler(Exception)
-async def generic_exc_handler(request: Request, exc: Exception):
+async def generic_exc_handler(request: Request, exc: Exception) -> JSONResponse:
     log.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
     return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
+class ModelInfo(TypedDict):
+    name: str
+    loaded: bool
+
+
 class LoadReq(BaseModel):
     model: str
     ttl: float = DEFAULT_TTL
@@ -130,7 +135,7 @@ def _refresh_ttl(entry: ModelEntry, ttl: float) -> None:
     entry["ttl_end"] = time.time() + max(entry["ttl_end"] - time.time(), ttl)
 
 
-async def ensure_loaded(name: str, ttl: float):
+async def ensure_loaded(name: str, ttl: float) -> None:
     if name in models:
         e = models[name]
         _refresh_ttl(e, ttl)
@@ -155,7 +160,7 @@ async def ensure_loaded(name: str, ttl: float):
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/list")
-async def list_models(loaded: str = "any"):
+async def list_models(loaded: str = "any") -> list[ModelInfo]:
     log.info(f"Request received: GET /list  loaded={loaded}")
     names = sorted(p.name for p in MODELS_DIR.iterdir() if p.is_dir()) if MODELS_DIR.exists() else []
     result = [{"name": n, "loaded": n in models} for n in names]
@@ -166,7 +171,7 @@ async def list_models(loaded: str = "any"):
 
 
 @app.post("/load")
-async def load(req: LoadReq):
+async def load(req: LoadReq) -> dict[str, str]:
     log.info(f"Request received: POST /load  model={req.model}")
     try:
         validate_model(req.model)
@@ -181,7 +186,7 @@ async def load(req: LoadReq):
 
 
 @app.post("/run")
-async def run(req: RunReq):
+async def run(req: RunReq) -> StreamingResponse:
     log.info(f"Request received: POST /run  model={req.model}")
     try:
         validate_model(req.model)
