@@ -1,6 +1,7 @@
 venv/
 __pycache__/
 *.pyc
-server.log
+logs/*
+!logs/.gitkeep
 models/*
 !models/.gitkeep

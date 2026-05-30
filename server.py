@@ -25,10 +25,14 @@ DEFAULT_REPETITION_PENALTY = 1.0
 MODELS_DIR = Path("models")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-_fmt     = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-_fh      = logging.FileHandler("server.log")
+_log_dir = Path("logs")
+_log_dir.mkdir(exist_ok=True)
+_log_file = _log_dir / f"{time.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+
+_fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+_fh  = logging.FileHandler(_log_file)
 _fh.setFormatter(_fmt)
-_ch      = logging.StreamHandler()
+_ch  = logging.StreamHandler()
 _ch.setFormatter(_fmt)
 
 log = logging.getLogger(__name__)
