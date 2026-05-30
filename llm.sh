@@ -4,6 +4,7 @@ set -euo pipefail
 PORT=8080
 BASE="http://localhost:$PORT"
 
+# Print usage and exit 1.
 usage() {
   echo "Usage:"
   echo "  $0 list [--loaded true|false|any]"
@@ -35,6 +36,8 @@ case "$CMD" in
       esac
     done
     [[ -z "$MODEL" ]] && usage
+
+    # Build and send request.
     BODY=$(python3 -c "
 import json, sys
 d = {'model': sys.argv[1]}
@@ -61,6 +64,8 @@ print(json.dumps(d))
       esac
     done
     [[ -z "$MODEL" || -z "$PROMPT" ]] && usage
+
+    # Build request body; omit optional fields when empty.
     BODY=$(python3 -c "
 import json, sys
 model, prompt, ttl, autoload, max_tokens, temperature, top_p, rep = sys.argv[1:]
@@ -73,6 +78,9 @@ if top_p:       d['top_p']              = float(top_p)
 if rep:         d['repetition_penalty'] = float(rep)
 print(json.dumps(d))
 " "$MODEL" "$PROMPT" "$TTL" "$AUTOLOAD" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P" "$REP_PENALTY")
+
+    # Stream SSE response; print tokens; surface errors.
+    # buf collects pre-SSE lines (e.g. HTTP error body); set to None once SSE begins.
     curl -sN -X POST "$BASE/run" \
       -H "Content-Type: application/json" \
       -H "Accept: text/event-stream" \
@@ -82,7 +90,7 @@ buf = []
 for line in sys.stdin:
     line = line.rstrip('\n')
     if line.startswith('data: '):
-        buf = None
+        buf = None  # entered SSE mode; stop buffering pre-SSE lines
         data = line[6:]
         if data == '[DONE]':
             print()
@@ -97,6 +105,7 @@ for line in sys.stdin:
             pass
     elif buf is not None and line.strip():
         buf.append(line)
+# buf is non-empty only if we never entered SSE mode (e.g. HTTP 4xx/5xx body).
 if buf:
     raw = ' '.join(buf)
     try:

@@ -64,19 +64,29 @@ models: dict[str, ModelEntry] = {}
 load_lock = asyncio.Lock()  # serializes all model loading
 
 
+# Evict TTL-expired, unlocked models every 5 s.
 async def ttl_monitor() -> None:
     while True:
         await asyncio.sleep(5)
+
+        # Collect expired, unlocked names.
         now = time.time()
-        for name in [n for n, e in list(models.items()) if now >= e["ttl_end"] and not e["lock"].locked()]:
+        expired = [
+            n for n, e in list(models.items())
+            if now >= e["ttl_end"] and not e["lock"].locked()
+        ]
+
+        # Evict.
+        for name in expired:
             del models[name]
             log.info(f"Model unloaded: {name}")
 
 
+# Wire uvicorn logs to our file handler; start TTL monitor.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for _n in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-        logging.getLogger(_n).addHandler(_fh)
+    for n in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        logging.getLogger(n).addHandler(_fh)
     log.info("Server started")
     asyncio.create_task(ttl_monitor())
     yield
@@ -124,6 +134,7 @@ class RunReq(BaseModel):
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+# Reject path traversal; raise 404 if model dir is absent.
 def validate_model(name: str) -> None:
     if "/" in name or ".." in Path(name).parts:
         raise HTTPException(400, f"Invalid model name: '{name}'")
@@ -131,45 +142,63 @@ def validate_model(name: str) -> None:
         raise HTTPException(404, f"Model '{name}' not found in models/")
 
 
+# Extend TTL by `ttl` seconds from now; never shorten an existing deadline.
 def _refresh_ttl(entry: ModelEntry, ttl: float) -> None:
-    entry["ttl_end"] = time.time() + max(entry["ttl_end"] - time.time(), ttl)
+    now = time.time()
+    entry["ttl_end"] = now + max(entry["ttl_end"] - now, ttl)
 
 
+# Load model into registry if absent; refresh TTL. Serializes loads via load_lock.
 async def ensure_loaded(name: str, ttl: float) -> None:
+    # Early exit if already loaded.
     if name in models:
-        e = models[name]
-        _refresh_ttl(e, ttl)
+        _refresh_ttl(models[name], ttl)
         return
 
     async with load_lock:
-        if name in models:  # second check after acquiring lock
-            e = models[name]
-            _refresh_ttl(e, ttl)
+        # Re-check under lock (double-checked locking).
+        if name in models:
+            _refresh_ttl(models[name], ttl)
             return
 
+        # Load tokenizer and model off the event loop.
         path = str(MODELS_DIR / name)
         log.info(f"Model loading: {name}")
-        t0   = time.time()
+        t0 = time.time()
         loop = asyncio.get_running_loop()
-        tok   = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
+        tok = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
         if tok.pad_token_id is None:
             tok.pad_token_id = tok.eos_token_id
         model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
-        models[name] = {"model": model, "tokenizer": tok, "lock": asyncio.Lock(), "ttl_end": time.time() + ttl}
+
+        # Register and log.
+        models[name] = {
+            "model": model,
+            "tokenizer": tok,
+            "lock": asyncio.Lock(),
+            "ttl_end": time.time() + ttl,
+        }
         log.info(f"Model loaded: {name}  ({time.time() - t0:.1f}s)")
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
+# Return all available models; filter by loaded=true|false|any.
 @app.get("/list")
 async def list_models(loaded: str = "any") -> list[ModelInfo]:
     log.info(f"Request received: GET /list  loaded={loaded}")
+
+    # Enumerate disk.
     names = sorted(p.name for p in MODELS_DIR.iterdir() if p.is_dir()) if MODELS_DIR.exists() else []
-    result = [{"name": n, "loaded": n in models} for n in names]
-    if loaded == "true":  result = [r for r in result if     r["loaded"]]
+    result: list[ModelInfo] = [{"name": n, "loaded": n in models} for n in names]
+
+    # Filter by loaded state.
+    if loaded == "true":  result = [r for r in result if r["loaded"]]
     if loaded == "false": result = [r for r in result if not r["loaded"]]
+
     log.info(f"Request completed: GET /list  returned={len(result)}")
     return result
 
 
+# Load a model into memory; idempotent if already loaded.
 @app.post("/load")
 async def load(req: LoadReq) -> dict[str, str]:
     log.info(f"Request received: POST /load  model={req.model}")
@@ -185,9 +214,12 @@ async def load(req: LoadReq) -> dict[str, str]:
     return {"status": "loaded", "model": req.model}
 
 
+# Stream inference tokens as SSE. autoload=true loads model if absent (requires ttl).
 @app.post("/run")
 async def run(req: RunReq) -> StreamingResponse:
     log.info(f"Request received: POST /run  model={req.model}")
+
+    # Validate and ensure model is ready.
     try:
         validate_model(req.model)
         if req.autoload:
@@ -202,18 +234,21 @@ async def run(req: RunReq) -> StreamingResponse:
             raise HTTPException(500, "Internal server error")
         raise
 
-    ttl   = req.ttl if req.ttl is not None else DEFAULT_TTL
+    ttl = req.ttl if req.ttl is not None else DEFAULT_TTL
     entry = models[req.model]
 
     async def stream():
         async with entry["lock"]:
             token_count = 0
             try:
-                m, tok   = entry["model"], entry["tokenizer"]
-                loop     = asyncio.get_running_loop()
-                inputs   = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(m.device))
+                # Tokenize prompt.
+                m, tok = entry["model"], entry["tokenizer"]
+                loop = asyncio.get_running_loop()
+                inputs = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(m.device))
+
+                # Start generation thread.
                 streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=60)
-                thread   = threading.Thread(
+                thread = threading.Thread(
                     target=m.generate,
                     kwargs=dict(**inputs, streamer=streamer, max_new_tokens=req.max_tokens,
                                 temperature=req.temperature, top_p=req.top_p,
@@ -221,12 +256,16 @@ async def run(req: RunReq) -> StreamingResponse:
                     daemon=True,
                 )
                 thread.start()
+
+                # Yield tokens.
                 while True:
                     token = await loop.run_in_executor(None, lambda: next(streamer, None))
                     if token is None:
                         break
                     token_count += 1
                     yield f"data: {json.dumps({'token': token})}\n\n"
+
+                # Signal completion.
                 log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
                 yield "data: [DONE]\n\n"
             except Exception as e:
