@@ -23,6 +23,7 @@ case "$CMD" in
     while [[ $# -gt 0 ]]; do
       case "$1" in --loaded) LOADED="$2"; shift 2 ;; *) usage ;; esac
     done
+    # Fetch and pretty-print.
     curl -s "$BASE/list?loaded=$LOADED" | python3 -m json.tool
     ;;
 
