@@ -146,16 +146,12 @@ async def ensure_loaded(name: str, ttl: float):
         log.info(f"Model loading: {name}")
         t0   = time.time()
         loop = asyncio.get_running_loop()
-        try:
-            tok   = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
-            if tok.pad_token_id is None:
-                tok.pad_token_id = tok.eos_token_id
-            model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
-            models[name] = {"model": model, "tokenizer": tok, "lock": asyncio.Lock(), "ttl_end": time.time() + ttl}
-            log.info(f"Model loaded: {name}  ({time.time() - t0:.1f}s)")
-        except Exception as e:
-            log.error(f"Failed to load model '{name}': {e}")
-            raise
+        tok   = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
+        if tok.pad_token_id is None:
+            tok.pad_token_id = tok.eos_token_id
+        model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
+        models[name] = {"model": model, "tokenizer": tok, "lock": asyncio.Lock(), "ttl_end": time.time() + ttl}
+        log.info(f"Model loaded: {name}  ({time.time() - t0:.1f}s)")
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/list")
@@ -177,6 +173,8 @@ async def load(req: LoadReq):
         await ensure_loaded(req.model, req.ttl)
     except Exception as e:
         log.error(f"Request failed: POST /load  model={req.model}  {type(e).__name__}: {e}")
+        if not isinstance(e, HTTPException):
+            raise HTTPException(500, "Internal server error")
         raise
     log.info(f"Request completed: POST /load  model={req.model}")
     return {"status": "loaded", "model": req.model}
@@ -195,6 +193,8 @@ async def run(req: RunReq):
             raise HTTPException(400, f"Model '{req.model}' is not loaded")
     except Exception as e:
         log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")
+        if not isinstance(e, HTTPException):
+            raise HTTPException(500, "Internal server error")
         raise
 
     ttl   = req.ttl if req.ttl is not None else DEFAULT_TTL
@@ -204,8 +204,9 @@ async def run(req: RunReq):
         async with entry["lock"]:
             token_count = 0
             try:
-                m, tok = entry["model"], entry["tokenizer"]
-                inputs   = tok(req.prompt, return_tensors="pt").to(m.device)
+                m, tok   = entry["model"], entry["tokenizer"]
+                loop     = asyncio.get_running_loop()
+                inputs   = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(m.device))
                 streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=60)
                 thread   = threading.Thread(
                     target=m.generate,
@@ -215,7 +216,6 @@ async def run(req: RunReq):
                     daemon=True,
                 )
                 thread.start()
-                loop = asyncio.get_running_loop()
                 while True:
                     token = await loop.run_in_executor(None, lambda: next(streamer, None))
                     if token is None:
