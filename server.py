@@ -25,16 +25,21 @@ DEFAULT_REPETITION_PENALTY = 1.0
 MODELS_DIR = Path("models")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-_handler = logging.FileHandler("server.log")
-_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_fmt     = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+_fh      = logging.FileHandler("server.log")
+_fh.setFormatter(_fmt)
+_ch      = logging.StreamHandler()
+_ch.setFormatter(_fmt)
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
-log.addHandler(_handler)
+log.addHandler(_fh)
+log.addHandler(_ch)
+log.propagate = False  # prevent double-printing via root logger
 
 # Write uvicorn access/error logs to our file as well
 for _n in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-    logging.getLogger(_n).addHandler(_handler)
+    logging.getLogger(_n).addHandler(_fh)
 
 # Silence noisy library output (progress bars, pad_token warnings, etc.)
 hf_logging.set_verbosity_error()
@@ -82,11 +87,11 @@ class RunReq(BaseModel):
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def require_exists(name: str) -> Path:
-    p = MODELS_DIR / name
-    if not p.exists():
+def require_exists(name: str) -> None:
+    if ".." in name or "/" in name:
+        raise HTTPException(400, f"Invalid model name: '{name}'")
+    if not (MODELS_DIR / name).exists():
         raise HTTPException(404, f"Model '{name}' not found in models/")
-    return p
 
 
 async def ensure_loaded(name: str, ttl: float):
@@ -103,13 +108,14 @@ async def ensure_loaded(name: str, ttl: float):
 
         path = str(MODELS_DIR / name)
         log.info(f"Model loading: {name}")
+        t0   = time.time()
         loop = asyncio.get_running_loop()
         tok   = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
         if tok.pad_token_id is None:
             tok.pad_token_id = tok.eos_token_id
         model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
         models[name] = {"model": model, "tokenizer": tok, "lock": asyncio.Lock(), "ttl_end": time.time() + ttl}
-        log.info(f"Model loaded: {name}")
+        log.info(f"Model loaded: {name}  ({time.time() - t0:.1f}s)")
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/list")
@@ -152,19 +158,23 @@ async def run(req: RunReq):
             try:
                 m, tok = entry["model"], entry["tokenizer"]
                 inputs   = tok(req.prompt, return_tensors="pt").to(m.device)
-                streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+                streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=60)
                 thread   = threading.Thread(
                     target=m.generate,
                     kwargs=dict(**inputs, streamer=streamer, max_new_tokens=req.max_tokens,
                                 temperature=req.temperature, top_p=req.top_p,
                                 repetition_penalty=req.repetition_penalty, do_sample=True),
+                    daemon=True,
                 )
                 thread.start()
                 token_count = 0
-                for token in streamer:
+                loop = asyncio.get_running_loop()
+                while True:
+                    token = await loop.run_in_executor(None, lambda: next(streamer, None))
+                    if token is None:
+                        break
                     token_count += 1
                     yield f"data: {json.dumps({'token': token})}\n\n"
-                thread.join()
                 entry["ttl_end"] = time.time() + max(entry["ttl_end"] - time.time(), ttl)
                 log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
                 yield "data: [DONE]\n\n"
