@@ -123,6 +123,35 @@ Plain text, one event per line, always with a datetime stamp. Logged events:
 - Model loaded / unloaded
 - Any other important events
 
+## Dependencies
+
+### requirements.txt
+
+List all dependencies except `torch`. `torch` is excluded because the correct wheel is CUDA-version-specific and must be installed separately.
+
+### .gitignore
+
+Include `venv/` and `__pycache__/`.
+
+### Install instructions (in README)
+
+Two-step setup:
+```bash
+# 1. Create and activate virtualenv
+python3 -m venv venv
+source venv/bin/activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Install torch — pick the line matching your CUDA version (check with nvidia-smi)
+pip install torch                                                       # CPU only
+pip install torch --index-url https://download.pytorch.org/whl/cu121   # CUDA 12.1
+pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA 12.4
+```
+
+`device_map="auto"` in `server.py` handles GPU vs CPU automatically at runtime — no code changes needed between environments.
+
 ## llm.sh
 
 Bash script. Sends requests to the server over HTTP; does not invoke `server.py` directly.
