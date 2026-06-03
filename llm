@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import http.client
 import json
 import sys
 import urllib.error
@@ -9,7 +10,7 @@ PORT = 8080
 BASE = f"http://localhost:{PORT}"
 
 
-def cmd_list(args):
+def cmd_list(args: argparse.Namespace) -> None:
 	url = f"{BASE}/list?loaded={args.loaded}"
 	try:
 		with urllib.request.urlopen(url) as resp:
@@ -19,7 +20,7 @@ def cmd_list(args):
 		sys.exit(1)
 
 
-def cmd_load(args):
+def cmd_load(args: argparse.Namespace) -> None:
 	body: dict = {"model": args.model}
 	if args.ttl is not None:
 		body["ttl"] = args.ttl
@@ -37,7 +38,7 @@ def cmd_load(args):
 		sys.exit(1)
 
 
-def cmd_run(args):
+def cmd_run(args: argparse.Namespace) -> None:
 	body: dict = {"model": args.model, "prompt": args.prompt}
 	if args.ttl is not None:
 		body["ttl"] = args.ttl
@@ -66,7 +67,7 @@ def cmd_run(args):
 		sys.exit(1)
 
 
-def _stream_sse(resp):
+def _stream_sse(resp: http.client.HTTPResponse) -> None:
 	# buf collects pre-SSE lines (e.g. an error body); set to None once SSE begins.
 	buf: list[str] | None = []
 	for raw in resp:
