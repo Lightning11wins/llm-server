@@ -12,7 +12,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, TextIteratorStreamer
 from transformers import logging as hf_logging
 
@@ -135,17 +135,17 @@ class ModelInfo(TypedDict):
 
 class LoadReq(BaseModel):
 	model: str
-	ttl: float = DEFAULT_TTL
+	ttl: float = Field(DEFAULT_TTL, gt=0)
 
 class RunReq(BaseModel):
 	model: str
-	prompt: str
-	ttl: float = DEFAULT_TTL
+	prompt: str = Field(..., min_length=1)
+	ttl: float = Field(DEFAULT_TTL, gt=0)
 	autoload: bool = False
-	max_tokens: int = DEFAULT_MAX_TOKENS
-	temperature: float = DEFAULT_TEMPERATURE
-	top_p: float = DEFAULT_TOP_P
-	repetition_penalty: float = DEFAULT_REPEAT_PENALTY
+	max_tokens: int = Field(DEFAULT_MAX_TOKENS, ge=1)
+	temperature: float = Field(DEFAULT_TEMPERATURE, gt=0)
+	top_p: float = Field(DEFAULT_TOP_P, gt=0, le=1.0)
+	repetition_penalty: float = Field(DEFAULT_REPEAT_PENALTY, gt=0)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -202,7 +202,9 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 @app.get("/list")
 async def list_models(loaded: str = "any") -> list[ModelInfo]:
 	log.info(f"Request received: GET /list  loaded={loaded}")
-	
+	if loaded not in ("any", "true", "false"):
+		raise HTTPException(400, f"Invalid loaded value: '{loaded}'. Must be 'any', 'true', or 'false'.")
+
 	# Enumerate disk.
 	names = sorted(p.name for p in MODELS_DIR.iterdir() if p.is_dir()) if MODELS_DIR.exists() else []
 	result: list[ModelInfo] = [{"name": n, "loaded": n in loaded_models} for n in names]
