@@ -263,9 +263,9 @@ async def run(req: RunReq) -> StreamingResponse:
 				inputs = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(model.device))
 				
 				# Start generation thread.
-				streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=STREAMER_TIMEOUT)
+				streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=STREAMER_TIMEOUT)  # type: ignore[arg-type]
 				thread = threading.Thread(
-					target=model.generate,
+					target=model.generate,  # type: ignore[arg-type]
 					kwargs=dict(**inputs, streamer=streamer, max_new_tokens=req.max_tokens,
 								temperature=req.temperature, top_p=req.top_p,
 								repetition_penalty=req.repetition_penalty, do_sample=True),
