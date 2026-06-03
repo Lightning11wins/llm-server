@@ -16,18 +16,22 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 from transformers import logging as hf_logging
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+HOST                    = "0.0.0.0"
 PORT                    = 8080
 DEFAULT_TTL             = 300
 DEFAULT_MAX_TOKENS      = 512
 DEFAULT_TEMPERATURE     = 1.0
 DEFAULT_TOP_P           = 1.0
 DEFAULT_REPETITION_PENALTY = 1.0
+TTL_MONITOR_INTERVAL    = 5
+STREAMER_TIMEOUT        = 60
 
 BASE_DIR   = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
+LOGS_DIR   = BASE_DIR / "logs"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-_log_dir = BASE_DIR / "logs"
+_log_dir = LOGS_DIR
 _log_dir.mkdir(exist_ok=True)
 _ts = time.strftime('%Y-%m-%d_%H-%M-%S')
 _log_file = _log_dir / f"{_ts}.log"
@@ -67,7 +71,7 @@ load_lock = asyncio.Lock()  # serializes all model loading
 # Evict TTL-expired, unlocked models every 5 s.
 async def ttl_monitor() -> None:
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(TTL_MONITOR_INTERVAL)
 
         # Collect expired, unlocked names.
         now = time.time()
@@ -249,7 +253,7 @@ async def run(req: RunReq) -> StreamingResponse:
                 inputs = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(m.device))
 
                 # Start generation thread.
-                streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=60)
+                streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=STREAMER_TIMEOUT)
                 thread = threading.Thread(
                     target=m.generate,
                     kwargs=dict(**inputs, streamer=streamer, max_new_tokens=req.max_tokens,
@@ -280,4 +284,4 @@ async def run(req: RunReq) -> StreamingResponse:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT)
