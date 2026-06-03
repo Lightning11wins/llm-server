@@ -170,7 +170,7 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 		log.info(f"Model loading: {name}")
 		t0 = time.time()
 		loop = asyncio.get_running_loop()
-		tok = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
+		tok: PreTrainedTokenizerBase = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
 		if tok.pad_token_id is None:
 			tok.pad_token_id = tok.eos_token_id
 		model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
