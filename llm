@@ -6,12 +6,8 @@ import sys
 import urllib.error
 import urllib.request
 
-PORT = 8080
-BASE = f"http://localhost:{PORT}"
-
-
 def cmd_list(args: argparse.Namespace) -> None:
-	url = f"{BASE}/list?loaded={args.loaded}"
+	url = f"{args.base}/list?loaded={args.loaded}"
 	try:
 		with urllib.request.urlopen(url) as resp:
 			print(json.dumps(json.loads(resp.read()), indent=2))
@@ -25,7 +21,7 @@ def cmd_load(args: argparse.Namespace) -> None:
 	if args.ttl is not None:
 		body["ttl"] = args.ttl
 	req = urllib.request.Request(
-		f"{BASE}/load",
+		f"{args.base}/load",
 		data=json.dumps(body).encode(),
 		headers={"Content-Type": "application/json"},
 		method="POST",
@@ -54,7 +50,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 		body["repetition_penalty"] = args.repetition_penalty
 
 	req = urllib.request.Request(
-		f"{BASE}/run",
+		f"{args.base}/run",
 		data=json.dumps(body).encode(),
 		headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
 		method="POST",
@@ -106,6 +102,8 @@ def _print_error_body(raw: str):
 
 def main():
 	parser = argparse.ArgumentParser(prog="llm")
+	parser.add_argument("--host", default="localhost")
+	parser.add_argument("--port", type=int, default=8080)
 	sub = parser.add_subparsers(dest="cmd", required=True)
 
 	p_list = sub.add_parser("list")
@@ -126,10 +124,11 @@ def main():
 	p_run.add_argument("--repetition-penalty", type=float, default=None, dest="repetition_penalty")
 
 	args = parser.parse_args()
+	args.base = f"http://{args.host}:{args.port}"
 	try:
 		{"list": cmd_list, "load": cmd_load, "run": cmd_run}[args.cmd](args)
 	except urllib.error.URLError as e:
-		print(f"Error: could not connect to server at {BASE} ({e.reason})", file=sys.stderr)
+		print(f"Error: could not connect to server at {args.base} ({e.reason})", file=sys.stderr)
 		sys.exit(1)
 
 
