@@ -125,7 +125,11 @@ def main():
 	p_run.add_argument("--repetition-penalty", type=float, default=None, dest="repetition_penalty")
 
 	args = parser.parse_args()
-	{"list": cmd_list, "load": cmd_load, "run": cmd_run}[args.cmd](args)
+	try:
+		{"list": cmd_list, "load": cmd_load, "run": cmd_run}[args.cmd](args)
+	except urllib.error.URLError as e:
+		print(f"Error: could not connect to server at {BASE} ({e.reason})", file=sys.stderr)
+		sys.exit(1)
 
 
 if __name__ == "__main__":
