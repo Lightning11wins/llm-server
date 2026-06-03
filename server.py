@@ -71,6 +71,7 @@ class LoadedModel(TypedDict):
 	tokenizer: PreTrainedTokenizerBase
 	lock: asyncio.Lock
 	ttl_end: float
+	pinned: int  # requests that have committed to using this model but not yet locked it
 
 loaded_models: dict[str, LoadedModel] = {}
 load_lock = asyncio.Lock()  # serialized model loading
@@ -85,7 +86,7 @@ async def ttl_monitor() -> None:
 		now = time.time()
 		expired = [
 			n for n, e in list(loaded_models.items())
-			if now >= e["ttl_end"] and not e["lock"].locked()
+			if now >= e["ttl_end"] and not e["lock"].locked() and e["pinned"] == 0
 		]
 		
 		# Evict.
@@ -194,6 +195,7 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 			"tokenizer": tok,
 			"lock": asyncio.Lock(),
 			"ttl_end": t1 + ttl,
+			"pinned": 0,
 		}
 		log.info(f"Model loaded: {name}  ({t1 - t0:.1f}s)")
 
@@ -243,8 +245,10 @@ async def run(req: RunReq) -> StreamingResponse:
 		validate_model(req.model)
 		if req.autoload:
 			await ensure_loaded(req.model, req.ttl)
-		elif req.model not in loaded_models:
+		loaded_model = loaded_models.get(req.model)
+		if loaded_model is None:
 			raise HTTPException(400, f"Model '{req.model}' is not loaded")
+		loaded_model["pinned"] += 1
 	except Exception as e:
 		log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")
 		if not isinstance(e, HTTPException):
@@ -252,18 +256,16 @@ async def run(req: RunReq) -> StreamingResponse:
 		raise
 
 	# Set up the inference stream.
-	loaded_model = loaded_models[req.model]
 	ttl = req.ttl
 	async def stream():
-		async with loaded_model["lock"]:
-			token_count = 0
-			try:
-				# Tokenize prompt.
+		token_count = 0
+		try:
+			async with loaded_model["lock"]:
 				model = loaded_model["model"]
 				tok = loaded_model["tokenizer"]
 				loop = asyncio.get_running_loop()
 				inputs = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(model.device))
-				
+
 				# Start generation thread.
 				streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=STREAMER_TIMEOUT)  # type: ignore[arg-type]
 				thread = threading.Thread(
@@ -274,7 +276,7 @@ async def run(req: RunReq) -> StreamingResponse:
 					daemon=True,
 				)
 				thread.start()
-				
+
 				# Yield tokens.
 				while True:
 					token = await loop.run_in_executor(None, lambda: next(streamer, None))
@@ -282,15 +284,15 @@ async def run(req: RunReq) -> StreamingResponse:
 						break
 					token_count += 1
 					yield f"data: {json.dumps({'token': token})}\n\n"
-				
-				# Signal completion.
+
 				log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
 				yield "data: [DONE]\n\n"
-			except Exception as e:
-				log.error(f"Inference error ({req.model}): {e}")
-				yield f"data: {json.dumps({'error': str(e)})}\n\n"
-			finally:
-				_refresh_ttl(loaded_model, ttl)
+		except Exception as e:
+			log.error(f"Inference error ({req.model}): {e}")
+			yield f"data: {json.dumps({'error': str(e)})}\n\n"
+		finally:
+			loaded_model["pinned"] -= 1
+			_refresh_ttl(loaded_model, ttl)
 
 	return StreamingResponse(stream(), media_type="text/event-stream")
 
