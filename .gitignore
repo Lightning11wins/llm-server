@@ -5,5 +5,4 @@ logs/*
 !logs/.gitkeep
 models/*
 !models/.gitkeep
-/.idea/.gitignore
-/.idea/vcs.xml
+/.idea/**
