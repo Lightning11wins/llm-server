@@ -21,7 +21,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def cmd_load(args: argparse.Namespace) -> None:
-	body: dict = {"model": args.model}
+	body: dict[str, object] = {"model": args.model}
 	if args.ttl is not None:
 		body["ttl"] = args.ttl
 	req = urllib.request.Request(
@@ -39,7 +39,7 @@ def cmd_load(args: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
-	body: dict = {"model": args.model, "prompt": args.prompt}
+	body: dict[str, object] = {"model": args.model, "prompt": args.prompt}
 	if args.ttl is not None:
 		body["ttl"] = args.ttl
 	if args.autoload:
