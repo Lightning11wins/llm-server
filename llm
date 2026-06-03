@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+
+PORT = 8080
+BASE = f"http://localhost:{PORT}"
+
+
+def cmd_list(args):
+	url = f"{BASE}/list?loaded={args.loaded}"
+	try:
+		with urllib.request.urlopen(url) as resp:
+			print(json.dumps(json.loads(resp.read()), indent=2))
+	except urllib.error.HTTPError as e:
+		_print_http_error(e)
+		sys.exit(1)
+
+
+def cmd_load(args):
+	body: dict = {"model": args.model}
+	if args.ttl is not None:
+		body["ttl"] = args.ttl
+	req = urllib.request.Request(
+		f"{BASE}/load",
+		data=json.dumps(body).encode(),
+		headers={"Content-Type": "application/json"},
+		method="POST",
+	)
+	try:
+		with urllib.request.urlopen(req) as resp:
+			print(resp.read().decode())
+	except urllib.error.HTTPError as e:
+		_print_http_error(e)
+		sys.exit(1)
+
+
+def cmd_run(args):
+	body: dict = {"model": args.model, "prompt": args.prompt}
+	if args.ttl is not None:
+		body["ttl"] = args.ttl
+	if args.autoload:
+		body["autoload"] = True
+	if args.max_tokens is not None:
+		body["max_tokens"] = args.max_tokens
+	if args.temperature is not None:
+		body["temperature"] = args.temperature
+	if args.top_p is not None:
+		body["top_p"] = args.top_p
+	if args.repetition_penalty is not None:
+		body["repetition_penalty"] = args.repetition_penalty
+
+	req = urllib.request.Request(
+		f"{BASE}/run",
+		data=json.dumps(body).encode(),
+		headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+		method="POST",
+	)
+	try:
+		with urllib.request.urlopen(req) as resp:
+			_stream_sse(resp)
+	except urllib.error.HTTPError as e:
+		_print_http_error(e)
+		sys.exit(1)
+
+
+def _stream_sse(resp):
+	# buf collects pre-SSE lines (e.g. an error body); set to None once SSE begins.
+	buf: list[str] | None = []
+	for raw in resp:
+		line = raw.decode().rstrip("\n")
+		if line.startswith("data: "):
+			buf = None
+			data = line[6:]
+			if data == "[DONE]":
+				print()
+				break
+			try:
+				d = json.loads(data)
+				if "token" in d:
+					print(d["token"], end="", flush=True)
+				elif "error" in d:
+					print(f"\nError: {d['error']}", file=sys.stderr)
+			except json.JSONDecodeError:
+				pass
+		elif buf is not None and line.strip():
+			buf.append(line)
+	if buf:
+		_print_error_body(" ".join(buf))
+		sys.exit(1)
+
+
+def _print_http_error(e: urllib.error.HTTPError):
+	_print_error_body(e.read().decode())
+
+
+def _print_error_body(raw: str):
+	try:
+		print(f"Error: {json.loads(raw).get('error', raw)}", file=sys.stderr)
+	except json.JSONDecodeError:
+		print(f"Error: {raw}", file=sys.stderr)
+
+
+def main():
+	parser = argparse.ArgumentParser(prog="llm")
+	sub = parser.add_subparsers(dest="cmd", required=True)
+
+	p_list = sub.add_parser("list")
+	p_list.add_argument("--loaded", default="any", choices=["true", "false", "any"])
+
+	p_load = sub.add_parser("load")
+	p_load.add_argument("--model", required=True)
+	p_load.add_argument("--ttl", type=float, default=None)
+
+	p_run = sub.add_parser("run")
+	p_run.add_argument("--model", required=True)
+	p_run.add_argument("--prompt", required=True)
+	p_run.add_argument("--ttl", type=float, default=None)
+	p_run.add_argument("--autoload", action="store_true")
+	p_run.add_argument("--max-tokens", type=int, default=None, dest="max_tokens")
+	p_run.add_argument("--temperature", type=float, default=None)
+	p_run.add_argument("--top-p", type=float, default=None, dest="top_p")
+	p_run.add_argument("--repetition-penalty", type=float, default=None, dest="repetition_penalty")
+
+	args = parser.parse_args()
+	{"list": cmd_list, "load": cmd_load, "run": cmd_run}[args.cmd](args)
+
+
+if __name__ == "__main__":
+	main()
