@@ -22,7 +22,7 @@ DEFAULT_TTL             = 300
 DEFAULT_MAX_TOKENS      = 512
 DEFAULT_TEMPERATURE     = 1.0
 DEFAULT_TOP_P           = 1.0
-DEFAULT_REPETITION_PENALTY = 1.0
+DEFAULT_REPEAT_PENALTY  = 1.0
 TTL_MONITOR_INTERVAL    = 5
 STREAMER_TIMEOUT        = 60
 
@@ -135,7 +135,7 @@ class RunReq(BaseModel):
     max_tokens: int = DEFAULT_MAX_TOKENS
     temperature: float = DEFAULT_TEMPERATURE
     top_p: float = DEFAULT_TOP_P
-    repetition_penalty: float = DEFAULT_REPETITION_PENALTY
+    repetition_penalty: float = DEFAULT_REPEAT_PENALTY
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 # Reject path traversal; raise 404 if model dir is absent.
