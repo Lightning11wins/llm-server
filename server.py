@@ -36,10 +36,10 @@ _log_dir.mkdir(exist_ok=True)
 _ts = time.strftime('%Y-%m-%d_%H-%M-%S')
 _log_file = _log_dir / f"{_ts}.log"
 if _log_file.exists():
-    _sfx = 2
-    while (_log_dir / f"{_ts}-{_sfx}.log").exists():
-        _sfx += 1
-    _log_file = _log_dir / f"{_ts}-{_sfx}.log"
+	_sfx = 2
+	while (_log_dir / f"{_ts}-{_sfx}.log").exists():
+		_sfx += 1
+	_log_file = _log_dir / f"{_ts}-{_sfx}.log"
 
 _fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 _fh  = logging.FileHandler(_log_file)
@@ -59,10 +59,10 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 # ── Model registry ─────────────────────────────────────────────────────────────
 class ModelEntry(TypedDict):
-    model: PreTrainedModel
-    tokenizer: PreTrainedTokenizerBase
-    lock: asyncio.Lock
-    ttl_end: float
+	model: PreTrainedModel
+	tokenizer: PreTrainedTokenizerBase
+	lock: asyncio.Lock
+	ttl_end: float
 
 models: dict[str, ModelEntry] = {}
 load_lock = asyncio.Lock()  # serializes all model loading
@@ -70,31 +70,31 @@ load_lock = asyncio.Lock()  # serializes all model loading
 
 # Evict TTL-expired, unlocked models every 5 s.
 async def ttl_monitor() -> None:
-    while True:
-        await asyncio.sleep(TTL_MONITOR_INTERVAL)
+	while True:
+		await asyncio.sleep(TTL_MONITOR_INTERVAL)
 
-        # Collect expired, unlocked names.
-        now = time.time()
-        expired = [
-            n for n, e in list(models.items())
-            if now >= e["ttl_end"] and not e["lock"].locked()
-        ]
+		# Collect expired, unlocked names.
+		now = time.time()
+		expired = [
+			n for n, e in list(models.items())
+			if now >= e["ttl_end"] and not e["lock"].locked()
+		]
 
-        # Evict.
-        for name in expired:
-            del models[name]
-            log.info(f"Model unloaded: {name}")
+		# Evict.
+		for name in expired:
+			del models[name]
+			log.info(f"Model unloaded: {name}")
 
 
 # Wire uvicorn logs to our file handler; start TTL monitor.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for n in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-        logging.getLogger(n).addHandler(_fh)
-    log.info("Server started")
-    asyncio.create_task(ttl_monitor())
-    yield
-    log.info("Server stopped")
+	for n in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+		logging.getLogger(n).addHandler(_fh)
+	log.info("Server started")
+	asyncio.create_task(ttl_monitor())
+	yield
+	log.info("Server stopped")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -102,186 +102,186 @@ app = FastAPI(lifespan=lifespan)
 
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+	return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exc_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    return JSONResponse(status_code=422, content={"error": str(exc)})
+	return JSONResponse(status_code=422, content={"error": str(exc)})
 
 
 @app.exception_handler(Exception)
 async def generic_exc_handler(request: Request, exc: Exception) -> JSONResponse:
-    log.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
-    return JSONResponse(status_code=500, content={"error": "Internal server error"})
+	log.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
+	return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
 class ModelInfo(TypedDict):
-    name: str
-    loaded: bool
+	name: str
+	loaded: bool
 
 
 class LoadReq(BaseModel):
-    model: str
-    ttl: float = DEFAULT_TTL
+	model: str
+	ttl: float = DEFAULT_TTL
 
 
 class RunReq(BaseModel):
-    model: str
-    prompt: str
-    ttl: float | None = None
-    autoload: bool = False
-    max_tokens: int = DEFAULT_MAX_TOKENS
-    temperature: float = DEFAULT_TEMPERATURE
-    top_p: float = DEFAULT_TOP_P
-    repetition_penalty: float = DEFAULT_REPEAT_PENALTY
+	model: str
+	prompt: str
+	ttl: float | None = None
+	autoload: bool = False
+	max_tokens: int = DEFAULT_MAX_TOKENS
+	temperature: float = DEFAULT_TEMPERATURE
+	top_p: float = DEFAULT_TOP_P
+	repetition_penalty: float = DEFAULT_REPEAT_PENALTY
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 # Reject path traversal; raise 404 if model dir is absent.
 def validate_model(name: str) -> None:
-    if "/" in name or ".." in Path(name).parts:
-        raise HTTPException(400, f"Invalid model name: '{name}'")
-    if not (MODELS_DIR / name).exists():
-        raise HTTPException(404, f"Model '{name}' not found in models/")
+	if "/" in name or ".." in Path(name).parts:
+		raise HTTPException(400, f"Invalid model name: '{name}'")
+	if not (MODELS_DIR / name).exists():
+		raise HTTPException(404, f"Model '{name}' not found in models/")
 
 
 # Extend TTL by `ttl` seconds from now; never shorten an existing deadline.
 def _refresh_ttl(entry: ModelEntry, ttl: float) -> None:
-    now = time.time()
-    entry["ttl_end"] = now + max(entry["ttl_end"] - now, ttl)
+	now = time.time()
+	entry["ttl_end"] = now + max(entry["ttl_end"] - now, ttl)
 
 
 # Load model into registry if absent; refresh TTL. Serializes loads via load_lock.
 async def ensure_loaded(name: str, ttl: float) -> None:
-    # Early exit if already loaded.
-    if name in models:
-        _refresh_ttl(models[name], ttl)
-        return
+	# Early exit if already loaded.
+	if name in models:
+		_refresh_ttl(models[name], ttl)
+		return
 
-    async with load_lock:
-        # Re-check under lock (double-checked locking).
-        if name in models:
-            _refresh_ttl(models[name], ttl)
-            return
+	async with load_lock:
+		# Re-check under lock (double-checked locking).
+		if name in models:
+			_refresh_ttl(models[name], ttl)
+			return
 
-        # Load tokenizer and model off the event loop.
-        path = str(MODELS_DIR / name)
-        log.info(f"Model loading: {name}")
-        t0 = time.time()
-        loop = asyncio.get_running_loop()
-        tok = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
-        if tok.pad_token_id is None:
-            tok.pad_token_id = tok.eos_token_id
-        model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
+		# Load tokenizer and model off the event loop.
+		path = str(MODELS_DIR / name)
+		log.info(f"Model loading: {name}")
+		t0 = time.time()
+		loop = asyncio.get_running_loop()
+		tok = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
+		if tok.pad_token_id is None:
+			tok.pad_token_id = tok.eos_token_id
+		model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
 
-        # Register and log.
-        t1 = time.time()
-        models[name] = {
-            "model": model,
-            "tokenizer": tok,
-            "lock": asyncio.Lock(),
-            "ttl_end": t1 + ttl,
-        }
-        log.info(f"Model loaded: {name}  ({t1 - t0:.1f}s)")
+		# Register and log.
+		t1 = time.time()
+		models[name] = {
+			"model": model,
+			"tokenizer": tok,
+			"lock": asyncio.Lock(),
+			"ttl_end": t1 + ttl,
+		}
+		log.info(f"Model loaded: {name}  ({t1 - t0:.1f}s)")
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 # Return all available models; filter by loaded=true|false|any.
 @app.get("/list")
 async def list_models(loaded: str = "any") -> list[ModelInfo]:
-    log.info(f"Request received: GET /list  loaded={loaded}")
+	log.info(f"Request received: GET /list  loaded={loaded}")
 
-    # Enumerate disk.
-    names = sorted(p.name for p in MODELS_DIR.iterdir() if p.is_dir()) if MODELS_DIR.exists() else []
-    result: list[ModelInfo] = [{"name": n, "loaded": n in models} for n in names]
+	# Enumerate disk.
+	names = sorted(p.name for p in MODELS_DIR.iterdir() if p.is_dir()) if MODELS_DIR.exists() else []
+	result: list[ModelInfo] = [{"name": n, "loaded": n in models} for n in names]
 
-    # Filter by loaded state.
-    if loaded == "true":  result = [r for r in result if r["loaded"]]
-    if loaded == "false": result = [r for r in result if not r["loaded"]]
+	# Filter by loaded state.
+	if loaded == "true":  result = [r for r in result if r["loaded"]]
+	if loaded == "false": result = [r for r in result if not r["loaded"]]
 
-    log.info(f"Request completed: GET /list  returned={len(result)}")
-    return result
+	log.info(f"Request completed: GET /list  returned={len(result)}")
+	return result
 
 
 # Load a model into memory; idempotent if already loaded.
 @app.post("/load")
 async def load(req: LoadReq) -> dict[str, str]:
-    log.info(f"Request received: POST /load  model={req.model}")
-    try:
-        validate_model(req.model)
-        await ensure_loaded(req.model, req.ttl)
-    except Exception as e:
-        log.error(f"Request failed: POST /load  model={req.model}  {type(e).__name__}: {e}")
-        if not isinstance(e, HTTPException):
-            raise HTTPException(500, "Internal server error")
-        raise
-    log.info(f"Request completed: POST /load  model={req.model}")
-    return {"status": "loaded", "model": req.model}
+	log.info(f"Request received: POST /load  model={req.model}")
+	try:
+		validate_model(req.model)
+		await ensure_loaded(req.model, req.ttl)
+	except Exception as e:
+		log.error(f"Request failed: POST /load  model={req.model}  {type(e).__name__}: {e}")
+		if not isinstance(e, HTTPException):
+			raise HTTPException(500, "Internal server error")
+		raise
+	log.info(f"Request completed: POST /load  model={req.model}")
+	return {"status": "loaded", "model": req.model}
 
 
 # Stream inference tokens as SSE. autoload=true loads model if absent (requires ttl).
 @app.post("/run")
 async def run(req: RunReq) -> StreamingResponse:
-    log.info(f"Request received: POST /run  model={req.model}")
+	log.info(f"Request received: POST /run  model={req.model}")
 
-    # Validate and ensure model is ready.
-    try:
-        validate_model(req.model)
-        if req.autoload:
-            if req.ttl is None:
-                raise HTTPException(400, "ttl is required when autoload=true")
-            await ensure_loaded(req.model, req.ttl)
-        elif req.model not in models:
-            raise HTTPException(400, f"Model '{req.model}' is not loaded")
-    except Exception as e:
-        log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")
-        if not isinstance(e, HTTPException):
-            raise HTTPException(500, "Internal server error")
-        raise
+	# Validate and ensure model is ready.
+	try:
+		validate_model(req.model)
+		if req.autoload:
+			if req.ttl is None:
+				raise HTTPException(400, "ttl is required when autoload=true")
+			await ensure_loaded(req.model, req.ttl)
+		elif req.model not in models:
+			raise HTTPException(400, f"Model '{req.model}' is not loaded")
+	except Exception as e:
+		log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")
+		if not isinstance(e, HTTPException):
+			raise HTTPException(500, "Internal server error")
+		raise
 
-    # Resolve defaults and get entry.
-    ttl = req.ttl if req.ttl is not None else DEFAULT_TTL
-    entry = models[req.model]
+	# Resolve defaults and get entry.
+	ttl = req.ttl if req.ttl is not None else DEFAULT_TTL
+	entry = models[req.model]
 
-    async def stream():
-        async with entry["lock"]:
-            token_count = 0
-            try:
-                # Tokenize prompt.
-                m, tok = entry["model"], entry["tokenizer"]
-                loop = asyncio.get_running_loop()
-                inputs = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(m.device))
+	async def stream():
+		async with entry["lock"]:
+			token_count = 0
+			try:
+				# Tokenize prompt.
+				m, tok = entry["model"], entry["tokenizer"]
+				loop = asyncio.get_running_loop()
+				inputs = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(m.device))
 
-                # Start generation thread.
-                streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=STREAMER_TIMEOUT)
-                thread = threading.Thread(
-                    target=m.generate,
-                    kwargs=dict(**inputs, streamer=streamer, max_new_tokens=req.max_tokens,
-                                temperature=req.temperature, top_p=req.top_p,
-                                repetition_penalty=req.repetition_penalty, do_sample=True),
-                    daemon=True,
-                )
-                thread.start()
+				# Start generation thread.
+				streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=STREAMER_TIMEOUT)
+				thread = threading.Thread(
+					target=m.generate,
+					kwargs=dict(**inputs, streamer=streamer, max_new_tokens=req.max_tokens,
+								temperature=req.temperature, top_p=req.top_p,
+								repetition_penalty=req.repetition_penalty, do_sample=True),
+					daemon=True,
+				)
+				thread.start()
 
-                # Yield tokens.
-                while True:
-                    token = await loop.run_in_executor(None, lambda: next(streamer, None))
-                    if token is None:
-                        break
-                    token_count += 1
-                    yield f"data: {json.dumps({'token': token})}\n\n"
+				# Yield tokens.
+				while True:
+					token = await loop.run_in_executor(None, lambda: next(streamer, None))
+					if token is None:
+						break
+					token_count += 1
+					yield f"data: {json.dumps({'token': token})}\n\n"
 
-                # Signal completion.
-                log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                log.error(f"Inference error ({req.model}): {e}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            finally:
-                _refresh_ttl(entry, ttl)
+				# Signal completion.
+				log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
+				yield "data: [DONE]\n\n"
+			except Exception as e:
+				log.error(f"Inference error ({req.model}): {e}")
+				yield f"data: {json.dumps({'error': str(e)})}\n\n"
+			finally:
+				_refresh_ttl(entry, ttl)
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+	return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT)
+	uvicorn.run(app, host=HOST, port=PORT)
