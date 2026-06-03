@@ -128,7 +128,10 @@ def main():
 	try:
 		{"list": cmd_list, "load": cmd_load, "run": cmd_run}[args.cmd](args)
 	except urllib.error.URLError as e:
-		print(f"Error: could not connect to server at {args.base} ({e.reason})", file=sys.stderr)
+		if isinstance(e.reason, OSError) and e.reason.errno is not None:
+			print(f"Error {e.reason.errno}: could not connect to server at {args.base} ({e.reason.strerror})", file=sys.stderr)
+		else:
+			print(f"Error: could not connect to server at {args.base} ({e.reason})", file=sys.stderr)
 		sys.exit(1)
 
 
