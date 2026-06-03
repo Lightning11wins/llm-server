@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -26,6 +27,8 @@ DEFAULT_TOP_P           = 1.0
 DEFAULT_REPEAT_PENALTY  = 1.0
 TTL_MONITOR_INTERVAL    = 5
 STREAMER_TIMEOUT        = 60
+
+MODEL_NAME_REGEX        = r"[a-zA-Z0-9_-]+"
 
 BASE_DIR   = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
@@ -148,7 +151,7 @@ class RunReq(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────────────────
 # Ensure that name is an available model.
 def validate_model(name: str) -> None:
-	if "/" in name or ".." in Path(name).parts:
+	if not re.fullmatch(MODEL_NAME_REGEX, name):
 		raise HTTPException(400, f"Invalid model name: '{name}'")
 	if not (MODELS_DIR / name).exists():
 		raise HTTPException(404, f"Model '{name}' not found in models/")
