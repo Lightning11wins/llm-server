@@ -140,7 +140,7 @@ class LoadReq(BaseModel):
 class RunReq(BaseModel):
 	model: str
 	prompt: str
-	ttl: float | None = None
+	ttl: float = DEFAULT_TTL
 	autoload: bool = False
 	max_tokens: int = DEFAULT_MAX_TOKENS
 	temperature: float = DEFAULT_TEMPERATURE
@@ -231,7 +231,7 @@ async def load(req: LoadReq) -> dict[str, str]:
 	return {"status": "loaded", "model": req.model}
 
 
-# Stream inference tokens as SSE. autoload=true loads model if absent (requires ttl).
+# Stream inference tokens as SSE. autoload=true loads model if absent.
 @app.post("/run")
 async def run(req: RunReq) -> StreamingResponse:
 	log.info(f"Request received: POST /run  model={req.model}")
@@ -240,8 +240,6 @@ async def run(req: RunReq) -> StreamingResponse:
 	try:
 		validate_model(req.model)
 		if req.autoload:
-			if req.ttl is None:
-				raise HTTPException(400, "ttl is required when autoload=true")
 			await ensure_loaded(req.model, req.ttl)
 		elif req.model not in loaded_models:
 			raise HTTPException(400, f"Model '{req.model}' is not loaded")
