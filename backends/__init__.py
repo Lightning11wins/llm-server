@@ -50,6 +50,10 @@ class Backend(ABC):
 	def generate(self, params: GenParams) -> Iterator[str]:
 		"""Yield generated text fragments. Blocking iterator. Raises on failure."""
 
+	def is_alive(self) -> bool:
+		"""False once the loaded model can no longer serve requests (e.g. its process died)."""
+		return True
+
 
 def read_model_config(model_dir: Path) -> dict[str, Any]:
 	"""Read and minimally validate models/<name>/model.json."""
@@ -58,7 +62,7 @@ def read_model_config(model_dir: Path) -> dict[str, Any]:
 		raise ModelConfigError(f"missing {MODEL_CONFIG_FILE}")
 	try:
 		config = json.loads(path.read_text())
-	except (OSError, json.JSONDecodeError) as e:
+	except (OSError, ValueError) as e:  # ValueError covers JSONDecodeError and UnicodeDecodeError
 		raise ModelConfigError(f"unreadable {MODEL_CONFIG_FILE}: {e}")
 	if not isinstance(config, dict) or not isinstance(config.get("backend"), str):
 		raise ModelConfigError(f"{MODEL_CONFIG_FILE} must be an object with a string 'backend' key")
