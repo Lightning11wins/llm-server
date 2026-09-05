@@ -49,6 +49,14 @@ for i in $(seq 1 30); do
 done
 
 fail=0
+# Run a command, print its output, and fail unless the output contains $1.
+expect() {
+	local pattern="$1"; shift
+	local out; out="$("$@" 2>&1)"
+	echo "$out"
+	grep -q -- "$pattern" <<< "$out" || { echo "EXPECTED: $pattern"; fail=1; }
+}
+
 for m in "${MODELS[@]}"; do
 	echo "=== $m"
 	echo "--- load:"
@@ -56,7 +64,7 @@ for m in "${MODELS[@]}"; do
 	echo "--- run:"
 	./llm --port $PORT run --model "$m" --ttl $TTL --prompt "The capital of France is" --max-tokens 24 --temperature 0.7 || fail=1
 	echo "--- run with stop (expect stop_reason: stop):"
-	./llm --port $PORT run --model "$m" --ttl $TTL --prompt "1, 2, 3, 4," --max-tokens 40 --stop "7" --temperature 0.3 2>&1 | tee /dev/stderr | grep -q "stop_reason: stop" || fail=1
+	expect "stop_reason: stop" ./llm --port $PORT run --model "$m" --ttl $TTL --prompt "1, 2, 3, 4," --max-tokens 40 --stop "," --temperature 0.3
 
 	# Chat mode: models without a chat template (gpt2) must be refused with a clear 400; the rest
 	# must answer, render their template and call a tool when asked to.
@@ -67,9 +75,9 @@ for m in "${MODELS[@]}"; do
 		echo "--- chat:"
 		./llm --port $PORT chat --model "$m" --ttl $TTL --system "Answer in one word." --user "What is the capital of France?" --no-thinking --max-tokens 24 --temperature 0.7 || fail=1
 		echo "--- chat with thinking (expect a reasoning event):"
-		./llm --port $PORT chat --model "$m" --ttl $TTL --user "What is 2+2? Just the number." --max-tokens 400 --json | tee /dev/stderr | grep -q '"reasoning"' || fail=1
+		expect '"reasoning"' ./llm --port $PORT chat --model "$m" --ttl $TTL --user "What is 2+2? Just the number." --max-tokens 400 --json
 		echo "--- tool call (expect tool_calls and stop_reason tool):"
-		./llm --port $PORT chat --model "$m" --ttl $TTL --user "What is the weather in Paris? Use the tool." --tools "$TOOLS" --no-thinking --max-tokens 200 --json | tee /dev/stderr | grep -q '"stop_reason": "tool"' || fail=1
+		expect '"stop_reason": "tool"' ./llm --port $PORT chat --model "$m" --ttl $TTL --user "What is the weather in Paris? Use the tool." --tools "$TOOLS" --no-thinking --max-tokens 200 --json
 	elif grep -q "has no chat template" "$tout"; then
 		echo "(no chat template; chat mode correctly refused)"
 	else
