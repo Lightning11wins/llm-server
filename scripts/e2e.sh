@@ -39,6 +39,25 @@ for m in "${MODELS[@]}"; do
 	./llm --port $PORT list --loaded true | grep -q '"name"' && { echo "STILL LOADED after TTL"; fail=1; }
 	echo "--- nvidia-smi after eviction:"
 	nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true
+
+	# Unload mid-generation: the running request must be cancelled and the model released.
+	echo "--- unload during generation:"
+	./llm --port $PORT load --model "$m" --ttl 60 > /dev/null || fail=1
+	./llm --port $PORT run --model "$m" --prompt "Write a long story about a robot." --max-tokens 4000 > /dev/null 2>&1 &
+	rpid=$!
+	sleep 3
+	if kill -0 $rpid 2>/dev/null; then
+		./llm --port $PORT unload --model "$m" || fail=1
+		wait $rpid && { echo "RUN SUCCEEDED after unload"; fail=1; }
+	else
+		# Nothing left to cancel: the model hit EOS first. Still check the unload itself.
+		echo "(generation finished before the unload)"
+		./llm --port $PORT unload --model "$m" || fail=1
+	fi
+	./llm --port $PORT list --loaded true | grep -q '"name"' && { echo "STILL LOADED after unload"; fail=1; }
+	./llm --port $PORT unload --model "$m" || fail=1  # idempotent
+	echo "--- nvidia-smi after unload:"
+	nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true
 done
 
 echo "--- leftover llama-server processes:"
