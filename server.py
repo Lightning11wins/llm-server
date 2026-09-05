@@ -27,7 +27,7 @@ DEFAULT_TOP_P           = 1.0
 DEFAULT_REPEAT_PENALTY  = 1.0
 TTL_MONITOR_INTERVAL    = 5
 
-MODEL_NAME_REGEX        = r"[a-zA-Z0-9_-]+"
+MODEL_NAME_REGEX        = r"[a-zA-Z0-9_-][a-zA-Z0-9._-]*"  # no leading dot, no path separators
 
 BASE_DIR   = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
