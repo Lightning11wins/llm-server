@@ -76,6 +76,7 @@ class LlamaCppBackend(Backend):
 	log_path: Path | None = None
 	port: int = 0
 	n_ctx: int | None = None
+	chat_template: bool = False
 
 	def __init__(self, name: str, model_dir: Path, config: dict[str, Any]) -> None:
 		super().__init__(name, model_dir, config)
@@ -135,7 +136,7 @@ class LlamaCppBackend(Backend):
 				raise RuntimeError(f"llama-server exited with code {self.proc.returncode} during load. {self._log_tail()}")
 			try:
 				if requests.get(f"{self.base_url}/health", timeout=2).ok:
-					self.n_ctx = self._read_n_ctx()
+					self._read_props()
 					return
 			except requests.RequestException:
 				pass
@@ -170,14 +171,20 @@ class LlamaCppBackend(Backend):
 		tail = self.log_path.read_text(errors="replace").splitlines()[-lines:]
 		return f"See {self.log_path.name}:\n" + "\n".join(tail)
 
-	# Per-slot context size, as llama-server reports it (n_ctx divided over the parallel slots).
-	def _read_n_ctx(self) -> int | None:
+	# Read what /props says about the loaded model: the per-slot context size (n_ctx divided over the
+	# parallel slots) and whether the GGUF carries a chat template. Without one llama-server would
+	# silently fall back to ChatML, so such models are restricted to raw prompts like on transformers.
+	def _read_props(self) -> None:
 		try:
 			props = requests.get(f"{self.base_url}/props", timeout=5).json()
 			n_ctx = props["default_generation_settings"]["n_ctx"]
 		except (requests.RequestException, ValueError, KeyError, TypeError):
-			return None
-		return n_ctx if isinstance(n_ctx, int) else None
+			return
+		self.n_ctx = n_ctx if isinstance(n_ctx, int) else None
+		self.chat_template = bool(props.get("chat_template"))
+
+	def has_chat_template(self) -> bool:
+		return self.chat_template
 
 	def context_length(self) -> int | None:
 		return self.n_ctx
@@ -247,6 +254,7 @@ class LlamaCppBackend(Backend):
 					prompt_n += timings.get("cache_n", 0)  # prompt_n counts only the tokens not served from cache
 				yield self._usage(prompt_n, timings.get("predicted_n"))
 				return
+		raise RuntimeError("llama-server stream ended without a final event")
 
 	def _chat(self, params: GenParams) -> Iterator[GenEvent]:
 		body: dict[str, Any] = {
@@ -285,9 +293,13 @@ class LlamaCppBackend(Backend):
 				if choice.get("finish_reason"):
 					finish_reason = choice["finish_reason"]
 
-		if tool_calls:
+		if finish_reason is None:
+			raise RuntimeError("llama-server stream ended without a finish_reason")
+		# Tool calls cut off by max_tokens have truncated arguments; they are dropped rather than
+		# handed to a harness as if they were complete. The stop_reason "length" tells the story.
+		if finish_reason == "tool_calls" and tool_calls:
 			yield {"tool_calls": [tool_calls[i] for i in sorted(tool_calls)]}
-		yield {"stop_reason": CHAT_STOP_REASONS.get(finish_reason or "", "tool" if tool_calls else "eos")}
+		yield {"stop_reason": CHAT_STOP_REASONS.get(finish_reason, "eos")}
 		yield self._usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
 
 

@@ -98,8 +98,9 @@ class TransformersBackend(Backend):
 		model, tok = self.model, self.tokenizer
 		assert model is not None and tok is not None, "generate() called before load()"
 
+		# A rendered template already carries the model's BOS token; adding another degrades output.
 		prompt = params.prompt if params.messages is None else self.render_template(params.messages, params.tools, params.template_args)
-		inputs = tok(prompt, return_tensors="pt").to(model.device)
+		inputs = tok(prompt, return_tensors="pt", add_special_tokens=params.messages is None).to(model.device)
 		prompt_tokens = int(inputs["input_ids"].shape[1])
 		eos_ids = model.generation_config.eos_token_id
 		eos_ids = set(eos_ids if isinstance(eos_ids, list) else [eos_ids]) - {None}
