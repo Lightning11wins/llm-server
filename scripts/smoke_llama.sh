@@ -4,9 +4,9 @@
 # Starts llama-server on port 8099, waits for health, runs one completion,
 # prints timings and VRAM use, then stops the server.
 set -euo pipefail
+MODEL="$(realpath "$1")"; shift   # resolve before cd so relative paths are relative to the caller
 cd "$(dirname "$0")/.."
 
-MODEL="$1"; shift
 PORT=8099
 LOG="$(mktemp)"
 
@@ -14,6 +14,7 @@ bin/llama.cpp/llama-server -m "$MODEL" --host 127.0.0.1 --port $PORT --no-webui 
 PID=$!
 # On exit: stop the server and print only warnings/errors from its log (full log kept if it failed).
 cleanup() {
+	set +e  # the server may already be gone; never let errexit abort the report below
 	kill $PID 2>/dev/null; wait $PID 2>/dev/null
 	echo "--- llama-server warnings/errors:"
 	grep -E '^[0-9.]+ [WE] ' "$LOG" | grep -v -E 'CORS|security risk|more info:|^[0-9.]+ W srv  llama_server: -+$' || echo "(none)"
