@@ -70,9 +70,17 @@ class LoadedModel(TypedDict):
 	lock: asyncio.Lock
 	ttl_end: float
 	pinned: int  # requests that have committed to using this model but not yet locked it
+	unloaded: bool  # set when the model leaves the registry; in-flight requests abort on it
 
 loaded_models: dict[str, LoadedModel] = {}
+loading_models: dict[str, bool] = {}  # name being loaded -> whether an unload was requested meanwhile
+unloading_models: dict[str, asyncio.Future] = {}  # name being released -> future that completes when it is
 load_lock = asyncio.Lock()  # serialized model loading
+
+
+# Raised inside a running request when its model is unloaded out from under it.
+class ModelUnloadedError(Exception):
+	pass
 
 
 # A model may be evicted when nothing is using it and it has either expired or its backend has died.
@@ -89,7 +97,41 @@ async def ttl_monitor() -> None:
 			await unload_model(name, only_if_evictable=True)
 
 
-# Remove a model from the registry and release its resources.
+# Take a model out of the registry so no further request can reach it, and hand its entry to the
+# caller, who then owns releasing it. Returns None if the model is absent or (with only_if_evictable)
+# still in use. There is no await here, so exactly one caller can ever take a given entry.
+def _take(name: str, *, only_if_evictable: bool) -> LoadedModel | None:
+	entry = loaded_models.get(name)
+	if entry is None or (only_if_evictable and not _evictable(entry)):
+		return None
+	del loaded_models[name]
+	entry["unloaded"] = True
+	return entry
+
+
+# Release a taken entry's resources off the event loop. Does not raise. The release is recorded in
+# unloading_models so ensure_loaded can wait for it rather than loading over memory still being freed.
+async def _release_backend(name: str, backend: Backend) -> None:
+	loop = asyncio.get_running_loop()
+	done = loop.create_future()
+	unloading_models[name] = done  # never already present: a reload waits for the release to finish
+	try:
+		await loop.run_in_executor(None, backend.unload)
+	except Exception as e:
+		log.error(f"Error unloading {name}: {type(e).__name__}: {e}")
+	finally:
+		del unloading_models[name]
+		done.set_result(None)
+	log.info(f"Model unloaded: {name}")
+
+
+# Wait for every in-flight backend release, so a load never overlaps with GPU memory being freed.
+async def _await_releases() -> None:
+	while unloading_models:
+		await asyncio.wait(list(unloading_models.values()))
+
+
+# Remove an idle model from the registry and release its resources.
 # Serialized with loading via load_lock, so a new model never starts loading while an old one is
 # still releasing GPU memory. With only_if_evictable=True the model is left alone unless it is idle
 # and expired/dead; the check is repeated under the lock because a request may have started meanwhile.
@@ -98,16 +140,29 @@ async def unload_model(name: str, *, only_if_evictable: bool = False) -> None:
 	if entry is None or (only_if_evictable and not _evictable(entry)):
 		return
 	async with load_lock:
-		entry = loaded_models.get(name)
-		if entry is None or (only_if_evictable and not _evictable(entry)):
+		entry = _take(name, only_if_evictable=only_if_evictable)
+		if entry is None:
 			return
-		del loaded_models[name]
-		loop = asyncio.get_running_loop()
-		try:
-			await loop.run_in_executor(None, entry["backend"].unload)
-		except Exception as e:
-			log.error(f"Error unloading {name}: {type(e).__name__}: {e}")
-		log.info(f"Model unloaded: {name}")
+		await _release_backend(name, entry["backend"])
+
+
+# Unload a model immediately, whatever it is doing. Unlike unload_model this neither waits for
+# in-flight generation nor queues behind a load of some other model, because the point of it is to
+# free VRAM now. Requests holding the entry see unloaded=True and abort with a clear error.
+# Returns what was found: "unloaded", "cancelled" (mid-load), "unloading" (already going) or "not_loaded".
+async def force_unload_model(name: str) -> str:
+	entry = _take(name, only_if_evictable=False)
+	if entry is not None:
+		log.info(f"Model unloading: {name}  (in-flight requests: {entry['pinned']})")
+		await _release_backend(name, entry["backend"])
+		return "unloaded"
+	if name in loading_models:
+		loading_models[name] = True  # ensure_loaded releases it as soon as the load returns
+		log.info(f"Model load cancelled: {name}")
+		return "cancelled"
+	if name in unloading_models:
+		return "unloading"
+	return "not_loaded"
 
 
 # Setup model manager.
@@ -121,8 +176,11 @@ async def lifespan(app: FastAPI):
 	
 	log.info("Server started")
 	yield
+	for name in list(loading_models):
+		loading_models[name] = True  # released by ensure_loaded once the load returns
 	for name in list(loaded_models):
 		await unload_model(name)
+	await _await_releases()
 	log.info("Server stopped")
 
 
@@ -169,6 +227,9 @@ class LoadReq(BaseModel):
 	model: str
 	ttl: float = Field(DEFAULT_TTL, gt=0)
 
+class UnloadReq(BaseModel):
+	model: str
+
 class RunReq(BaseModel):
 	model: str
 	prompt: str = Field(..., min_length=1)
@@ -181,10 +242,15 @@ class RunReq(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-# Ensure that name is an available model with a valid model.json.
-def validate_model(name: str) -> None:
+# Ensure that name is a syntactically valid model name.
+def validate_model_name(name: str) -> None:
 	if not re.fullmatch(MODEL_NAME_REGEX, name):
 		raise HTTPException(400, f"Invalid model name: '{name}'")
+
+
+# Ensure that name is an available model with a valid model.json.
+def validate_model(name: str) -> None:
+	validate_model_name(name)
 	if not (MODELS_DIR / name).is_dir():
 		raise HTTPException(404, f"Model '{name}' not found in models/")
 	try:
@@ -217,15 +283,29 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 			_refresh_ttl(loaded_models[name], ttl)
 			return
 
-		# Build the backend from model.json and load it off the event loop.
+		# A forced unload releases without holding load_lock, so wait for any release still in
+		# progress before claiming GPU memory. Nothing else can reach this point meanwhile.
+		await _await_releases()
+
+		# Build the backend from model.json and load it off the event loop. The load cannot be
+		# interrupted, so an unload arriving meanwhile is recorded in loading_models and applied
+		# the moment the model is up, rather than leaving it loaded.
+		loading_models[name] = False
 		try:
-			backend = create_backend(name, MODELS_DIR / name)
-		except ModelConfigError as e:
-			raise HTTPException(400, f"Model '{name}' has an invalid config: {e}")
-		log.info(f"Model loading: {name}  backend={backend.config['backend']}")
-		t0 = time.time()
-		loop = asyncio.get_running_loop()
-		await loop.run_in_executor(None, backend.load)
+			try:
+				backend = create_backend(name, MODELS_DIR / name)
+			except ModelConfigError as e:
+				raise HTTPException(400, f"Model '{name}' has an invalid config: {e}")
+			log.info(f"Model loading: {name}  backend={backend.config['backend']}")
+			t0 = time.time()
+			loop = asyncio.get_running_loop()
+			await loop.run_in_executor(None, backend.load)
+		finally:
+			cancelled = loading_models.pop(name, False)
+
+		if cancelled:
+			await _release_backend(name, backend)
+			raise HTTPException(409, f"Model '{name}' was unloaded while it was loading")
 
 		# Register and log.
 		t1 = time.time()
@@ -234,6 +314,7 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 			"lock": asyncio.Lock(),
 			"ttl_end": t1 + ttl,
 			"pinned": 0,
+			"unloaded": False,
 		}
 		log.info(f"Model loaded: {name}  ({t1 - t0:.1f}s)")
 
@@ -273,6 +354,27 @@ async def load(req: LoadReq) -> dict[str, str]:
 	return {"status": "loaded", "model": req.model}
 
 
+# Unload a model immediately, aborting any requests currently using it.
+@app.post("/unload")
+async def unload(req: UnloadReq) -> dict[str, str]:
+	log.info(f"Request received: POST /unload  model={req.model}")
+	try:
+		validate_model_name(req.model)
+		# A model that is loaded (or loading) is always unloadable, even if its directory or
+		# model.json has since been removed or broken on disk.
+		known = req.model in loaded_models or req.model in loading_models or req.model in unloading_models
+		if not known and not (MODELS_DIR / req.model).is_dir():
+			raise HTTPException(404, f"Model '{req.model}' not found in models/")
+		status = await force_unload_model(req.model)
+	except Exception as e:
+		log.error(f"Request failed: POST /unload  model={req.model}  {type(e).__name__}: {e}")
+		if not isinstance(e, HTTPException):
+			raise HTTPException(500, "Internal server error")
+		raise
+	log.info(f"Request completed: POST /unload  model={req.model}  status={status}")
+	return {"status": status, "model": req.model}
+
+
 # Stream inference tokens as SSE. autoload=true loads model if absent.
 @app.post("/run")
 async def run(req: RunReq) -> StreamingResponse:
@@ -300,31 +402,50 @@ async def run(req: RunReq) -> StreamingResponse:
 	async def stream():
 		token_count = 0
 		try:
+			# The model may have been unloaded while this request waited its turn on the lock.
 			async with loaded_model["lock"]:
+				if loaded_model["unloaded"]:
+					raise ModelUnloadedError
 				loop = asyncio.get_running_loop()
 				params = GenParams(prompt=req.prompt, max_tokens=req.max_tokens, temperature=req.temperature,
 								   top_p=req.top_p, repetition_penalty=req.repetition_penalty)
 				gen = loaded_model["backend"].generate(params)
 
-				# Pull tokens from the blocking generator off the event loop.
-				while True:
-					token = await loop.run_in_executor(None, next, gen, None)
-					if token is None:
-						break
-					token_count += 1
-					yield f"data: {json.dumps({'token': token})}\n\n"
+				# Pull tokens from the blocking generator off the event loop. An unload mid-stream
+				# either breaks the backend (raising here) or is caught by the check below.
+				try:
+					while True:
+						token = await loop.run_in_executor(None, next, gen, None)
+						if token is None:
+							break  # finished; an unload landing now does not spoil a complete answer
+						if loaded_model["unloaded"]:
+							raise ModelUnloadedError
+						token_count += 1
+						yield f"data: {json.dumps({'token': token})}\n\n"
+				finally:
+					# On client disconnect the worker thread may still be inside next(gen); closing
+					# a running generator raises, so leave it to be finalized when the thread returns.
+					if not gen.gi_running:
+						gen.close()
 
 				log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
 				yield "data: [DONE]\n\n"
 		except Exception as e:
-			log.error(f"Inference error ({req.model}): {e}")
-			yield f"data: {json.dumps({'error': str(e)})}\n\n"
+			# An unload races the backend failing, so it is what the client is told either way.
+			if loaded_model["unloaded"]:
+				log.info(f"Request cancelled: POST /run  model={req.model}  tokens={token_count}  (model unloaded)")
+				error = f"Model '{req.model}' was unloaded; request cancelled after {token_count} tokens"
+			else:
+				log.error(f"Inference error ({req.model}): {e}")
+				error = str(e)
+			yield f"data: {json.dumps({'error': error})}\n\n"
 
 	# Unpin from the response's finalizer rather than the generator's `finally`: if the client
 	# disconnects before streaming starts, the generator is never entered and its `finally` never runs.
 	def release() -> None:
 		loaded_model["pinned"] -= 1
-		_refresh_ttl(loaded_model, ttl)
+		if not loaded_model["unloaded"]:
+			_refresh_ttl(loaded_model, ttl)
 
 	return FinalizedStreamingResponse(stream(), release, media_type="text/event-stream")
 
