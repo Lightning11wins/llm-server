@@ -76,7 +76,6 @@ class LlamaCppBackend(Backend):
 	log_path: Path | None = None
 	port: int = 0
 	n_ctx: int | None = None
-	chat_template: bool = False
 
 	def __init__(self, name: str, model_dir: Path, config: dict[str, Any]) -> None:
 		super().__init__(name, model_dir, config)
@@ -136,7 +135,7 @@ class LlamaCppBackend(Backend):
 				raise RuntimeError(f"llama-server exited with code {self.proc.returncode} during load. {self._log_tail()}")
 			try:
 				if requests.get(f"{self.base_url}/health", timeout=2).ok:
-					self._read_props()
+					self.n_ctx = self._read_n_ctx()
 					return
 			except requests.RequestException:
 				pass
@@ -171,20 +170,19 @@ class LlamaCppBackend(Backend):
 		tail = self.log_path.read_text(errors="replace").splitlines()[-lines:]
 		return f"See {self.log_path.name}:\n" + "\n".join(tail)
 
-	# Read what /props says about the loaded model: the per-slot context size (n_ctx divided over the
-	# parallel slots) and whether the GGUF carries a chat template. Without one llama-server would
-	# silently fall back to ChatML, so such models are restricted to raw prompts like on transformers.
-	def _read_props(self) -> None:
+	# Per-slot context size, as llama-server reports it (n_ctx divided over the parallel slots).
+	def _read_n_ctx(self) -> int | None:
 		try:
 			props = requests.get(f"{self.base_url}/props", timeout=5).json()
 			n_ctx = props["default_generation_settings"]["n_ctx"]
 		except (requests.RequestException, ValueError, KeyError, TypeError):
-			return
-		self.n_ctx = n_ctx if isinstance(n_ctx, int) else None
-		self.chat_template = bool(props.get("chat_template"))
+			return None
+		return n_ctx if isinstance(n_ctx, int) else None
 
+	# Always true: a GGUF without an embedded template gets llama-server's ChatML fallback. /props
+	# reports that fallback as the model's template, so the two cases cannot be told apart here.
 	def has_chat_template(self) -> bool:
-		return self.chat_template
+		return True
 
 	def context_length(self) -> int | None:
 		return self.n_ctx
