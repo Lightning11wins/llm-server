@@ -132,7 +132,26 @@ GET /list?loaded=any|true|false
 
 Blocks until loaded. If already loaded, refreshes TTL. `ttl` (seconds) defaults to 300.
 
-Returns `{"status": "loaded", "model": "qwen3.5-9b"}`.
+Returns `{"status": "loaded", "model": "qwen3.5-9b"}`. Returns HTTP 409 if the model is unloaded while this load is in flight.
+
+### POST /unload
+
+```json
+{"model": "qwen3.5-9b"}
+```
+
+Unloads the model immediately, freeing its VRAM without waiting for anything in flight. Requests generating with it are cancelled and end with `data: {"error": "Model '...' was unloaded; request cancelled after N tokens"}`.
+
+Returns `{"status": "...", "model": "qwen3.5-9b"}` with one of:
+
+| Status | Meaning |
+|---|---|
+| `unloaded` | The model was loaded and has been released. |
+| `cancelled` | A load was in flight; it is released the moment it finishes and its `/load` returns 409. |
+| `unloading` | A TTL eviction or an earlier unload is already releasing it. |
+| `not_loaded` | Nothing to do. |
+
+Unloading is idempotent, so any of these is a success. HTTP 404 is returned only for a name that is neither loaded nor present in `models/`.
 
 ### POST /run
 
@@ -164,9 +183,10 @@ On mid-stream error: `data: {"error": "..."}` then stream closes.
 
 ```bash
 ./llm [--host <h>] [--port <p>] list [--loaded true|false|any]
-./llm load --model <name> [--ttl <s>]
-./llm run  --model <name> --prompt <text> [--autoload --ttl <s>] \
-           [--max-tokens <n>] [--temperature <f>] [--top-p <f>] [--repetition-penalty <f>]
+./llm load   --model <name> [--ttl <s>]
+./llm unload --model <name>
+./llm run    --model <name> --prompt <text> [--autoload --ttl <s>] \
+             [--max-tokens <n>] [--temperature <f>] [--top-p <f>] [--repetition-penalty <f>]
 ```
 
 ## Testing
@@ -200,5 +220,9 @@ The prompt is passed to the model as raw text. Instruction-tuned models (Qwen et
 - **A crashed `llama-server` is detected** — `/run` returns HTTP 500 for it, `/load` reloads it, and the TTL monitor evicts it on its next pass.
 - **`llm run` exits non-zero** when the stream ends with an error event.
 - **Model loading is serialized** — only one model loads at a time. Concurrent load requests for different models queue behind each other.
+- **`/unload` does not queue** — unlike TTL eviction, it neither waits for in-flight generation nor for an unrelated load to finish, since its purpose is to free VRAM now. Everything else on the model is collateral: cancelled with an error, never left half-served. Loads do wait for it: a `/load` that arrives while VRAM is still being released starts once the release is done.
+- **`/unload` acts on the present state only** — it cancels the load in progress, not loads queued behind it. If a second `/load` for the same model is already waiting its turn, the model comes back as soon as the cancelled load has released it.
+- **`/unload` on a `transformers` model stops the stream but not the work** — the client is cancelled at once, but the tensors are only dropped when the already-running `generate` thread finishes, so VRAM comes back a moment later. A `llama-cpp` model is killed outright.
+- **There is no VRAM accounting** — nothing checks free memory before a load. A `llama-cpp` model that does not fit fails its load with the CUDA error in `logs/llama-<model>-<ts>.log`; a `transformers` model silently spills to CPU. Use `/unload` to make room.
 - **Per-model inference queue** — concurrent requests to the same model are queued; requests to different loaded models run in parallel.
 - **TTL expiry has up to 5s lag** — the TTL monitor polls every 5 seconds, so models may stay loaded slightly past their TTL.
