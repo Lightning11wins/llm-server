@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import re
-import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,8 +12,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, TextIteratorStreamer
 from transformers import logging as hf_logging
+
+from backends import Backend, GenParams, ModelConfigError, create_backend, read_model_config
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -26,7 +26,6 @@ DEFAULT_TEMPERATURE     = 1.0
 DEFAULT_TOP_P           = 1.0
 DEFAULT_REPEAT_PENALTY  = 1.0
 TTL_MONITOR_INTERVAL    = 5
-STREAMER_TIMEOUT        = 60
 
 MODEL_NAME_REGEX        = r"[a-zA-Z0-9_-]+"
 
@@ -67,8 +66,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 # ── Model registry ─────────────────────────────────────────────────────────────
 class LoadedModel(TypedDict):
-	model: PreTrainedModel
-	tokenizer: PreTrainedTokenizerBase
+	backend: Backend
 	lock: asyncio.Lock
 	ttl_end: float
 	pinned: int  # requests that have committed to using this model but not yet locked it
@@ -91,8 +89,20 @@ async def ttl_monitor() -> None:
 		
 		# Evict.
 		for name in expired:
-			del loaded_models[name]
-			log.info(f"Model unloaded: {name}")
+			await unload_model(name)
+
+
+# Remove a model from the registry and release its resources.
+async def unload_model(name: str) -> None:
+	entry = loaded_models.pop(name, None)
+	if entry is None:
+		return
+	loop = asyncio.get_running_loop()
+	try:
+		await loop.run_in_executor(None, entry["backend"].unload)
+	except Exception as e:
+		log.error(f"Error unloading {name}: {type(e).__name__}: {e}")
+	log.info(f"Model unloaded: {name}")
 
 
 # Setup model manager.
@@ -106,6 +116,8 @@ async def lifespan(app: FastAPI):
 	
 	log.info("Server started")
 	yield
+	for name in list(loaded_models):
+		await unload_model(name)
 	log.info("Server stopped")
 
 
@@ -150,12 +162,16 @@ class RunReq(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-# Ensure that name is an available model.
+# Ensure that name is an available model with a valid model.json.
 def validate_model(name: str) -> None:
 	if not re.fullmatch(MODEL_NAME_REGEX, name):
 		raise HTTPException(400, f"Invalid model name: '{name}'")
-	if not (MODELS_DIR / name).exists():
+	if not (MODELS_DIR / name).is_dir():
 		raise HTTPException(404, f"Model '{name}' not found in models/")
+	try:
+		read_model_config(MODELS_DIR / name)
+	except ModelConfigError as e:
+		raise HTTPException(400, f"Model '{name}' has an invalid config: {e}")
 
 
 # Extend a model's if `ttl` (in seconds) is longer.
@@ -178,21 +194,20 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 			_refresh_ttl(loaded_models[name], ttl)
 			return
 		
-		# Load tokenizer and model off the event loop.
-		path = str(MODELS_DIR / name)
-		log.info(f"Model loading: {name}")
+		# Build the backend from model.json and load it off the event loop.
+		try:
+			backend = create_backend(name, MODELS_DIR / name)
+		except ModelConfigError as e:
+			raise HTTPException(400, f"Model '{name}' has an invalid config: {e}")
+		log.info(f"Model loading: {name}  backend={backend.config['backend']}")
 		t0 = time.time()
 		loop = asyncio.get_running_loop()
-		tok = await loop.run_in_executor(None, lambda: AutoTokenizer.from_pretrained(path))
-		if tok.pad_token_id is None:
-			tok.pad_token_id = tok.eos_token_id
-		model = await loop.run_in_executor(None, lambda: AutoModelForCausalLM.from_pretrained(path, device_map="auto"))
-		
+		await loop.run_in_executor(None, backend.load)
+
 		# Register and log.
 		t1 = time.time()
 		loaded_models[name] = {
-			"model": model,
-			"tokenizer": tok,
+			"backend": backend,
 			"lock": asyncio.Lock(),
 			"ttl_end": t1 + ttl,
 			"pinned": 0,
@@ -261,25 +276,14 @@ async def run(req: RunReq) -> StreamingResponse:
 		token_count = 0
 		try:
 			async with loaded_model["lock"]:
-				model = loaded_model["model"]
-				tok = loaded_model["tokenizer"]
 				loop = asyncio.get_running_loop()
-				inputs = await loop.run_in_executor(None, lambda: tok(req.prompt, return_tensors="pt").to(model.device))
+				params = GenParams(prompt=req.prompt, max_tokens=req.max_tokens, temperature=req.temperature,
+								   top_p=req.top_p, repetition_penalty=req.repetition_penalty)
+				gen = loaded_model["backend"].generate(params)
 
-				# Start generation thread.
-				streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=STREAMER_TIMEOUT)  # type: ignore[arg-type]
-				thread = threading.Thread(
-					target=model.generate,  # type: ignore[arg-type]
-					kwargs=dict(**inputs, streamer=streamer, max_new_tokens=req.max_tokens,
-								temperature=req.temperature, top_p=req.top_p,
-								repetition_penalty=req.repetition_penalty, do_sample=True),
-					daemon=True,
-				)
-				thread.start()
-
-				# Yield tokens.
+				# Pull tokens from the blocking generator off the event loop.
 				while True:
-					token = await loop.run_in_executor(None, lambda: next(streamer, None))
+					token = await loop.run_in_executor(None, next, gen, None)
 					if token is None:
 						break
 					token_count += 1
