@@ -5,6 +5,7 @@ Every model directory under models/ must contain a `model.json` describing how t
 run it. The only required key is `backend`; the rest is backend-specific:
 
     {"backend": "transformers"}
+    {"backend": "llama-cpp", "model": "foo.gguf", "args": ["-ngl", "99", "-c", "32768"]}
 
 A backend is a plain object with blocking `load()`, `unload()` and `generate()`
 methods. The server calls them from a thread pool so the event loop stays free.
@@ -72,8 +73,9 @@ def create_backend(name: str, model_dir: Path) -> Backend:
 
 
 # Imported last to avoid circular imports; each module registers itself here.
-from . import transformers_backend  # noqa: E402
+from . import transformers_backend, llama_cpp  # noqa: E402
 
 BACKENDS: dict[str, type[Backend]] = {
 	"transformers": transformers_backend.TransformersBackend,
+	"llama-cpp": llama_cpp.LlamaCppBackend,
 }
