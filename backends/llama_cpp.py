@@ -36,10 +36,12 @@ SHUTDOWN_GRACE          = 10    # seconds between SIGTERM and SIGKILL
 SSE_PING_INTERVAL       = 15    # seconds; llama-server emits SSE comments at this rate while silent (e.g. prompt processing)
 READ_TIMEOUT            = 60    # seconds without any bytes (token or ping) before the stream is considered dead
 
-# Flags the server sets itself; letting model.json override them would break the health check/proxy.
-RESERVED_ARGS = {"-m", "--model", "--host", "--port", "--no-webui", "--webui"}
+# Flags model.json may not set: the server chooses the model file and binding itself, and an API key
+# would make its own proxied requests fail.
+RESERVED_ARGS = {"-m", "--model", "-mu", "--model-url", "-hf", "--hf-repo", "--host", "--port",
+				 "--no-webui", "--webui", "--api-key"}
 
-_libc = ctypes.CDLL(None, use_errno=True)  # resolved once at import so the forked child makes a single C call
+_prctl = ctypes.CDLL(None, use_errno=True).prctl  # resolved at import so the forked child makes a single C call
 PR_SET_PDEATHSIG = 1
 
 
@@ -56,7 +58,7 @@ def _die_with_parent() -> None:
 	executor worker; those threads live until interpreter shutdown, so in practice this means
 	"when the server process exits", including crashes and SIGKILL. unload() is the normal path.
 	"""
-	_libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+	_prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
 class LlamaCppBackend(Backend):
