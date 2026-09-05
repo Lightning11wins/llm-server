@@ -11,7 +11,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from transformers import logging as hf_logging
 
 from backends import Backend, GenParams, ModelConfigError, TemplateError, create_backend, read_model_config
@@ -227,18 +227,23 @@ class ModelInfo(TypedDict):
 	loaded: bool
 	context_length: int | None  # None unless loaded (and known)
 
-class LoadReq(BaseModel):
+# Unknown keys are rejected (422) rather than ignored, so a misspelled optional field cannot
+# silently turn into a different request.
+class StrictModel(BaseModel):
+	model_config = ConfigDict(extra="forbid")
+
+class LoadReq(StrictModel):
 	model: str
 	ttl: float = Field(DEFAULT_TTL, gt=0)
 
-class UnloadReq(BaseModel):
+class UnloadReq(StrictModel):
 	model: str
 
 # Fields shared by /run (chat mode) and /template. Messages and tools follow the OpenAI chat schema:
 # {"role": "system"|"user"|"assistant"|"tool", "content": ...} plus tool_calls/tool_call_id/
 # reasoning_content where relevant; tools are {"type": "function", "function": {...}} schemas.
 # Only the shape is checked here: what a role or key means is up to the model's chat template.
-class ChatFields(BaseModel):
+class ChatFields(StrictModel):
 	messages: list[dict[str, Any]] | None = None
 	tools: list[dict[str, Any]] | None = None
 	template_args: dict[str, Any] = Field(default_factory=dict)
@@ -387,14 +392,14 @@ async def pin_model(endpoint: str, name: str, autoload: bool, ttl: float) -> Loa
 		raise
 
 
-# Render a chat request through the pinned model's template off the event loop. Raises HTTPException:
-# 400 when the model has no template or rejects the messages, 409 when it is unloaded meanwhile.
-async def render_template(entry: LoadedModel, name: str, req: ChatFields) -> str:
+# Render a chat request through the pinned model's template off the event loop. `template_args` must
+# already include the model's template_defaults. Raises HTTPException: 400 when the model has no
+# template or rejects the messages, 409 when it is unloaded meanwhile.
+async def render_template(entry: LoadedModel, name: str, req: ChatFields, template_args: dict[str, Any]) -> str:
 	assert req.messages is not None
 	backend = entry["backend"]
 	if not backend.has_chat_template():
 		raise HTTPException(400, f"Model '{name}' has no chat template; send a raw 'prompt' instead of 'messages'")
-	template_args = {**backend.template_defaults, **req.template_args}
 	loop = asyncio.get_running_loop()
 	try:
 		return await loop.run_in_executor(None, backend.render_template, req.messages, req.tools, template_args)
@@ -475,7 +480,8 @@ async def template(req: TemplateReq) -> dict[str, str]:
 	log.info(f"Request received: POST /template  model={req.model}")
 	loaded_model = await pin_model("/template", req.model, req.autoload, req.ttl)
 	try:
-		prompt = await render_template(loaded_model, req.model, req)
+		template_args = {**loaded_model["backend"].template_defaults, **req.template_args}
+		prompt = await render_template(loaded_model, req.model, req, template_args)
 	except Exception as e:
 		log.error(f"Request failed: POST /template  model={req.model}  {type(e).__name__}: {e}")
 		raise
@@ -494,12 +500,13 @@ async def run(req: RunReq) -> StreamingResponse:
 	log.info(f"Request received: POST /run  model={req.model}  mode={mode}")
 	loaded_model = await pin_model("/run", req.model, req.autoload, req.ttl)
 
-	# Chat requests are rendered once up front so a model without a template, or messages the
-	# template rejects, fail with a proper HTTP 400 rather than an error event inside a 200 stream.
+	# Chat requests are rendered once up front, purely to validate them: a model without a template,
+	# or messages the template rejects, fail with a proper HTTP 400 rather than an error event
+	# inside a 200 stream. The rendered text is not needed; the backend renders again when generating.
 	template_args = {**loaded_model["backend"].template_defaults, **req.template_args}
 	if req.messages is not None:
 		try:
-			await render_template(loaded_model, req.model, req)
+			await render_template(loaded_model, req.model, req, template_args)
 		except Exception as e:
 			loaded_model["pinned"] -= 1
 			log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")

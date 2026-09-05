@@ -92,7 +92,8 @@ def _chat_body(args: argparse.Namespace) -> dict[str, object]:
 		try:
 			template_args[key] = json.loads(raw)
 		except json.JSONDecodeError:
-			template_args[key] = raw  # bare strings are allowed as a convenience
+			print(f"Error: --template-arg value for '{key}' is not JSON: {raw!r} (strings need quotes, booleans are true/false)", file=sys.stderr)
+			sys.exit(2)
 	if template_args:
 		body["template_args"] = template_args
 	return body
@@ -177,6 +178,7 @@ def _stream_sse(resp: http.client.HTTPResponse, raw: bool) -> None:
 				continue
 			if raw:
 				print(json.dumps(d), flush=True)
+				failed = failed or "error" in d
 				continue
 			if "reasoning" in d:
 				if not reasoning_open:
