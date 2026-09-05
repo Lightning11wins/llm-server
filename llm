@@ -66,6 +66,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 def _stream_sse(resp: http.client.HTTPResponse) -> None:
 	# buf collects pre-SSE lines (e.g. an error body); set to None once SSE begins.
 	buf: list[str] | None = []
+	failed = False
 	for raw in resp:
 		line = raw.decode().rstrip("\n")
 		if line.startswith("data: "):
@@ -80,12 +81,15 @@ def _stream_sse(resp: http.client.HTTPResponse) -> None:
 					print(d["token"], end="", flush=True)
 				elif "error" in d:
 					print(f"\nError: {d['error']}", file=sys.stderr)
+					failed = True
 			except json.JSONDecodeError:
 				pass
 		elif buf is not None and line.strip():
 			buf.append(line)
 	if buf:
 		_print_error_body(" ".join(buf))
+		sys.exit(1)
+	if failed:
 		sys.exit(1)
 
 
