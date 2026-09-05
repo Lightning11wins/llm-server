@@ -28,11 +28,11 @@ class _StopOnEvent(StoppingCriteria):
 class TransformersBackend(Backend):
 	model: PreTrainedModel | None = None
 	tokenizer: PreTrainedTokenizerBase | None = None
-	_thread: threading.Thread | None = None  # the generate thread of the latest request, if any
-
 	def __init__(self, *args, **kwargs) -> None:
 		super().__init__(*args, **kwargs)
 		self._stop = threading.Event()
+		self._lock = threading.Lock()  # guards _threads and the start-vs-unload decision
+		self._threads: set[threading.Thread] = set()  # generate threads that may still be running
 
 	def load(self) -> None:
 		path = str(self.model_dir)
@@ -43,13 +43,15 @@ class TransformersBackend(Backend):
 		self.model = AutoModelForCausalLM.from_pretrained(path, device_map="auto")
 
 	def unload(self) -> None:
-		# The generate thread holds references to the model, so nothing is freed until it exits.
-		# Stop it at its next token and wait, so the VRAM is actually returned before we report done.
+		# Generate threads hold references to the model, so nothing is freed until they all exit.
+		# Stop them at their next token and wait, so the VRAM is actually returned before we report
+		# done. The event is set before taking the lock, so no new thread can start after the snapshot.
 		self._stop.set()
-		thread = self._thread
-		if thread is not None:
+		with self._lock:
+			threads = list(self._threads)
+		for thread in threads:
 			thread.join()
-		self._thread = None
+		self._threads.clear()
 		self.model = None
 		self.tokenizer = None
 		gc.collect()
@@ -70,6 +72,12 @@ class TransformersBackend(Backend):
 						stopping_criteria=StoppingCriteriaList([_StopOnEvent(self._stop)])),
 			daemon=True,
 		)
-		self._thread = thread
-		thread.start()
+		with self._lock:
+			if self._stop.is_set():
+				raise RuntimeError("model unloaded")
+			self._threads = {t for t in self._threads if t.is_alive()}
+			self._threads.add(thread)
+			thread.start()
 		yield from streamer
+		if self._stop.is_set():
+			raise RuntimeError("model unloaded")  # do not pass off a stopped generation as complete
