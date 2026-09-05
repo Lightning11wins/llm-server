@@ -283,15 +283,18 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 			_refresh_ttl(loaded_models[name], ttl)
 			return
 
-		# A forced unload releases without holding load_lock, so wait for any release still in
-		# progress before claiming GPU memory. Nothing else can reach this point meanwhile.
-		await _await_releases()
-
-		# Build the backend from model.json and load it off the event loop. The load cannot be
-		# interrupted, so an unload arriving meanwhile is recorded in loading_models and applied
-		# the moment the model is up, rather than leaving it loaded.
+		# From here the load is in flight: an unload arriving meanwhile is recorded in loading_models
+		# and applied at the first opportunity, rather than leaving the model loaded.
 		loading_models[name] = False
 		try:
+			# A forced unload releases without holding load_lock, so wait for any release still in
+			# progress before claiming GPU memory. Nothing else can reach this point meanwhile.
+			await _await_releases()
+			if loading_models[name]:
+				raise HTTPException(409, f"Model '{name}' was unloaded while it was loading")
+
+			# Build the backend from model.json and load it off the event loop. The load itself
+			# cannot be interrupted, so a cancel during it is applied the moment the model is up.
 			try:
 				backend = create_backend(name, MODELS_DIR / name)
 			except ModelConfigError as e:
