@@ -71,6 +71,7 @@ class LoadedModel(TypedDict):
 	ttl_end: float
 	pinned: int  # requests that have committed to using this model but not yet locked it
 	unloaded: bool  # set when the model leaves the registry; in-flight requests abort on it
+	crashed: bool  # set when it left because its backend died, so requests report the crash, not an unload
 
 loaded_models: dict[str, LoadedModel] = {}
 loading_models: dict[str, bool] = {}  # name being loaded -> whether an unload was requested meanwhile
@@ -275,6 +276,7 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 			_refresh_ttl(entry, ttl)
 			return
 		log.error(f"Model backend died, reloading: {name}")
+		entry["crashed"] = True
 		await unload_model(name)
 
 	async with load_lock:
@@ -318,6 +320,7 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 			"ttl_end": t1 + ttl,
 			"pinned": 0,
 			"unloaded": False,
+			"crashed": False,
 		}
 		log.info(f"Model loaded: {name}  ({t1 - t0:.1f}s)")
 
@@ -434,8 +437,9 @@ async def run(req: RunReq) -> StreamingResponse:
 				log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
 				yield "data: [DONE]\n\n"
 		except Exception as e:
-			# An unload races the backend failing, so it is what the client is told either way.
-			if loaded_model["unloaded"]:
+			# An unload races the backend failing, so it is what the client is told either way,
+			# unless the model was taken out because its backend had already died on its own.
+			if loaded_model["unloaded"] and not loaded_model["crashed"]:
 				log.info(f"Request cancelled: POST /run  model={req.model}  tokens={token_count}  (model unloaded)")
 				error = f"Model '{req.model}' was unloaded; request cancelled after {token_count} tokens"
 			else:
