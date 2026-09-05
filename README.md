@@ -64,7 +64,7 @@ Every model directory **must** contain a `model.json` naming its backend. Direct
 ```
 
 - `model` (required): GGUF filename inside the model directory.
-- `args` (optional): extra `llama-server` flags. The server always sets `-m`, `--host 127.0.0.1`, `--port <free port>` and `--no-webui`. Run `bin/llama.cpp/llama-server --help` for the full list. Useful ones: `-ngl N` (layers on GPU), `-c N` (context size), `-fa on` (flash attention), `--n-cpu-moe N` (keep the first N layers' MoE experts in CPU RAM), `-ctk q8_0 -ctv q8_0` (quantized KV cache), `--fit on` (auto-tune to fit device memory).
+- `args` (optional): extra `llama-server` flags. The server always sets `-m`, `--host 127.0.0.1`, `--port <free port>` and `--no-webui`, and rejects configs that try to override them. Run `bin/llama.cpp/llama-server --help` for the full list. Useful ones: `-ngl N` (layers on GPU), `-c N` (context size), `-fa on` (flash attention), `--n-cpu-moe N` (keep the first N layers' MoE experts in CPU RAM), `-ctk q8_0 -ctv q8_0` (quantized KV cache), `--fit on` (auto-tune to fit device memory).
 - `startup_timeout` (optional, seconds): how long to wait for the model to load. Default 300.
 
 Each subprocess logs to `logs/llama-<model>-<timestamp>.log`.
@@ -196,7 +196,9 @@ The prompt is passed to the model as raw text. Instruction-tuned models (Qwen et
 - **`do_sample=True` is always set** on the transformers backend — generation is always stochastic.
 - **`device_map="auto"` silently spills to CPU** on the transformers backend — if a model exceeds available VRAM, layers overflow to system RAM with no error, making inference much slower. Use the `llama-cpp` backend for anything that does not fit in VRAM.
 - **Unloading a `llama-cpp` model kills its subprocess**, which frees VRAM fully. Unloading a `transformers` model frees the tensors but the CUDA context stays resident in this process (a few hundred MB).
-- **Subprocesses die with the server** — `llama-server` children are started with `PR_SET_PDEATHSIG`, so a crashed or killed server does not leave GPU memory held by orphans.
+- **Subprocesses die with the server** — `llama-server` children are started with `PR_SET_PDEATHSIG`, so a crashed or killed server does not leave GPU memory held by orphans. (The signal is tied to the executor thread that spawned the child; those threads live for the life of the process.)
+- **A crashed `llama-server` is detected** — `/run` returns HTTP 500 for it, `/load` reloads it, and the TTL monitor evicts it on its next pass.
+- **`llm run` exits non-zero** when the stream ends with an error event.
 - **Model loading is serialized** — only one model loads at a time. Concurrent load requests for different models queue behind each other.
 - **Per-model inference queue** — concurrent requests to the same model are queued; requests to different loaded models run in parallel.
 - **TTL expiry has up to 5s lag** — the TTL monitor polls every 5 seconds, so models may stay loaded slightly past their TTL.
