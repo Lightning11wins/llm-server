@@ -78,6 +78,9 @@ class TransformersBackend(Backend):
 			self._threads = {t for t in self._threads if t.is_alive()}
 			self._threads.add(thread)
 			thread.start()
+		# This suspended frame must not keep the weights alive: unload() frees them right after the
+		# generate thread exits, possibly before the server gets around to closing this generator.
+		del model, inputs
 		yield from streamer
 		if self._stop.is_set():
 			raise RuntimeError("model unloaded")  # do not pass off a stopped generation as complete
