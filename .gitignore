@@ -6,6 +6,7 @@ logs/*
 models/*
 !models/.gitkeep
 /.idea/**
+/.claude/**
 
 # Local llama.cpp binaries
 bin/
