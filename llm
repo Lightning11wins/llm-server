@@ -20,8 +20,16 @@ def cmd_load(args: argparse.Namespace) -> None:
 	body: dict[str, object] = {"model": args.model}
 	if args.ttl is not None:
 		body["ttl"] = args.ttl
+	_post(f"{args.base}/load", body)
+
+
+def cmd_unload(args: argparse.Namespace) -> None:
+	_post(f"{args.base}/unload", {"model": args.model})
+
+
+def _post(url: str, body: dict[str, object]) -> None:
 	req = urllib.request.Request(
-		f"{args.base}/load",
+		url,
 		data=json.dumps(body).encode(),
 		headers={"Content-Type": "application/json"},
 		method="POST",
@@ -117,6 +125,9 @@ def main():
 	p_load.add_argument("--model", required=True)
 	p_load.add_argument("--ttl", type=float, default=None)
 
+	p_unload = sub.add_parser("unload")
+	p_unload.add_argument("--model", required=True)
+
 	p_run = sub.add_parser("run")
 	p_run.add_argument("--model", required=True)
 	p_run.add_argument("--prompt", required=True)
@@ -130,7 +141,7 @@ def main():
 	args = parser.parse_args()
 	args.base = f"http://{args.host}:{args.port}"
 	try:
-		{"list": cmd_list, "load": cmd_load, "run": cmd_run}[args.cmd](args)
+		{"list": cmd_list, "load": cmd_load, "unload": cmd_unload, "run": cmd_run}[args.cmd](args)
 	except urllib.error.URLError as e:
 		if isinstance(e.reason, OSError) and e.reason.errno is not None:
 			print(f"Error {e.reason.errno}: could not connect to server at {args.base} ({e.reason.strerror})", file=sys.stderr)
