@@ -22,6 +22,12 @@ if [ ${#MODELS[@]} -eq 0 ]; then
 	MODELS=($(ls -d models/*/ | xargs -n1 basename))
 fi
 
+TOOLS="$(mktemp)"
+cat > "$TOOLS" <<'EOF'
+[{"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a city",
+  "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+EOF
+
 # Run the server under the AppArmor profile when it is loaded, so the tests
 # exercise the same confinement as run.sh. Checked by entering the profile,
 # not by looking in /etc/apparmor.d: an installed but unloaded profile would
@@ -33,9 +39,9 @@ else
 	echo "note: the llm-server AppArmor profile is not loaded; running unconfined" >&2
 fi
 
-$CONFINE venv/bin/python -c "import server, uvicorn; uvicorn.run(server.app, host='127.0.0.1', port=$PORT)" > "$LOG" 2>&1 &
+PORT=$PORT $CONFINE venv/bin/python -c "import server, uvicorn; uvicorn.run(server.app, host='127.0.0.1', port=$PORT)" > "$LOG" 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo; echo "--- server log:"; cat "$LOG"; rm -f "$LOG"' EXIT
+trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo; echo "--- server log:"; cat "$LOG"; rm -f "$LOG" "$TOOLS"' EXIT
 
 for i in $(seq 1 30); do
 	curl -sf "http://127.0.0.1:$PORT/list" > /dev/null 2>&1 && break
@@ -49,6 +55,27 @@ for m in "${MODELS[@]}"; do
 	./llm --port $PORT load --model "$m" --ttl $TTL || fail=1
 	echo "--- run:"
 	./llm --port $PORT run --model "$m" --ttl $TTL --prompt "The capital of France is" --max-tokens 24 --temperature 0.7 || fail=1
+	echo "--- run with stop (expect stop_reason: stop):"
+	./llm --port $PORT run --model "$m" --ttl $TTL --prompt "1, 2, 3, 4," --max-tokens 40 --stop "7" --temperature 0.3 2>&1 | tee /dev/stderr | grep -q "stop_reason: stop" || fail=1
+
+	# Chat mode: models without a chat template (gpt2) must be refused with a clear 400; the rest
+	# must answer, render their template and call a tool when asked to.
+	echo "--- template:"
+	tout="$(mktemp)"
+	if ./llm --port $PORT template --model "$m" --ttl $TTL --system "Be brief." --user "Hi" --no-thinking > "$tout" 2>&1; then
+		cat "$tout"; echo
+		echo "--- chat:"
+		./llm --port $PORT chat --model "$m" --ttl $TTL --system "Answer in one word." --user "What is the capital of France?" --no-thinking --max-tokens 24 --temperature 0.7 || fail=1
+		echo "--- chat with thinking (expect a reasoning event):"
+		./llm --port $PORT chat --model "$m" --ttl $TTL --user "What is 2+2? Just the number." --max-tokens 400 --json | tee /dev/stderr | grep -q '"reasoning"' || fail=1
+		echo "--- tool call (expect tool_calls and stop_reason tool):"
+		./llm --port $PORT chat --model "$m" --ttl $TTL --user "What is the weather in Paris? Use the tool." --tools "$TOOLS" --no-thinking --max-tokens 200 --json | tee /dev/stderr | grep -q '"stop_reason": "tool"' || fail=1
+	elif grep -q "has no chat template" "$tout"; then
+		echo "(no chat template; chat mode correctly refused)"
+	else
+		cat "$tout"; fail=1
+	fi
+	rm -f "$tout"
 	echo "--- nvidia-smi:"
 	nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true
 	echo "--- loaded:"

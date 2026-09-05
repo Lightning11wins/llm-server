@@ -5,16 +5,16 @@ import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Callable, TypedDict
+from typing import Any, Callable, TypedDict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from transformers import logging as hf_logging
 
-from backends import Backend, GenParams, ModelConfigError, create_backend, read_model_config
+from backends import Backend, GenParams, ModelConfigError, TemplateError, create_backend, read_model_config
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -225,6 +225,7 @@ class FinalizedStreamingResponse(StreamingResponse):
 class ModelInfo(TypedDict):
 	name: str
 	loaded: bool
+	context_length: int | None  # None unless loaded (and known)
 
 class LoadReq(BaseModel):
 	model: str
@@ -233,15 +234,53 @@ class LoadReq(BaseModel):
 class UnloadReq(BaseModel):
 	model: str
 
-class RunReq(BaseModel):
+# Fields shared by /run (chat mode) and /template. Messages and tools follow the OpenAI chat schema:
+# {"role": "system"|"user"|"assistant"|"tool", "content": ...} plus tool_calls/tool_call_id/
+# reasoning_content where relevant; tools are {"type": "function", "function": {...}} schemas.
+# Only the shape is checked here: what a role or key means is up to the model's chat template.
+class ChatFields(BaseModel):
+	messages: list[dict[str, Any]] | None = None
+	tools: list[dict[str, Any]] | None = None
+	template_args: dict[str, Any] = Field(default_factory=dict)
+
+	@model_validator(mode="after")
+	def _check_messages(self):
+		if self.messages is not None:
+			if not self.messages:
+				raise ValueError("'messages' must not be empty")
+			for i, m in enumerate(self.messages):
+				if not isinstance(m.get("role"), str) or not m["role"]:
+					raise ValueError(f"messages[{i}] must have a string 'role'")
+		if self.tools is not None and any(not isinstance(t.get("function"), dict) for t in self.tools):
+			raise ValueError("each tool must be an object with a 'function' object (OpenAI function schema)")
+		return self
+
+class RunReq(ChatFields):
 	model: str
-	prompt: str = Field(..., min_length=1)
+	prompt: str | None = Field(None, min_length=1)
+	stop: list[str] = Field(default_factory=list, max_length=16)
 	ttl: float = Field(DEFAULT_TTL, gt=0)
 	autoload: bool = False
 	max_tokens: int = Field(DEFAULT_MAX_TOKENS, ge=1)
 	temperature: float = Field(DEFAULT_TEMPERATURE, gt=0)
 	top_p: float = Field(DEFAULT_TOP_P, gt=0, le=1.0)
 	repetition_penalty: float = Field(DEFAULT_REPEAT_PENALTY, gt=0)
+
+	@model_validator(mode="after")
+	def _check_mode(self):
+		if (self.prompt is None) == (self.messages is None):
+			raise ValueError("exactly one of 'prompt' and 'messages' is required")
+		if self.prompt is not None and (self.tools or self.template_args):
+			raise ValueError("'tools' and 'template_args' apply only with 'messages'")
+		if any(not s for s in self.stop):
+			raise ValueError("'stop' entries must be non-empty strings")
+		return self
+
+class TemplateReq(ChatFields):
+	model: str
+	messages: list[dict[str, Any]]
+	ttl: float = Field(DEFAULT_TTL, gt=0)
+	autoload: bool = False
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -324,7 +363,48 @@ async def ensure_loaded(name: str, ttl: float) -> None:
 			"unloaded": False,
 			"crashed": False,
 		}
-		log.info(f"Model loaded: {name}  ({t1 - t0:.1f}s)")
+		log.info(f"Model loaded: {name}  ({t1 - t0:.1f}s)  context_length={backend.context_length()}")
+
+
+# Validate the model, optionally load it, and pin it so it cannot be evicted while the request
+# runs. The caller must unpin (`entry["pinned"] -= 1`) on every path, including failures.
+async def pin_model(endpoint: str, name: str, autoload: bool, ttl: float) -> LoadedModel:
+	try:
+		validate_model(name)
+		if autoload:
+			await ensure_loaded(name, ttl)
+		entry = loaded_models.get(name)
+		if entry is None:
+			raise HTTPException(400, f"Model '{name}' is not loaded")
+		if not entry["backend"].is_alive():
+			raise HTTPException(500, f"Model '{name}' backend has died; it will be unloaded shortly, load it again")
+		entry["pinned"] += 1
+		return entry
+	except Exception as e:
+		log.error(f"Request failed: POST {endpoint}  model={name}  {type(e).__name__}: {e}")
+		if not isinstance(e, HTTPException):
+			raise HTTPException(500, "Internal server error")
+		raise
+
+
+# Render a chat request through the pinned model's template off the event loop. Raises HTTPException:
+# 400 when the model has no template or rejects the messages, 409 when it is unloaded meanwhile.
+async def render_template(entry: LoadedModel, name: str, req: ChatFields) -> str:
+	assert req.messages is not None
+	backend = entry["backend"]
+	if not backend.has_chat_template():
+		raise HTTPException(400, f"Model '{name}' has no chat template; send a raw 'prompt' instead of 'messages'")
+	template_args = {**backend.template_defaults, **req.template_args}
+	loop = asyncio.get_running_loop()
+	try:
+		return await loop.run_in_executor(None, backend.render_template, req.messages, req.tools, template_args)
+	except TemplateError as e:
+		raise HTTPException(400, str(e))
+	except Exception:
+		if entry["unloaded"]:
+			raise HTTPException(409, f"Model '{name}' was unloaded")
+		raise
+
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 # Get a list of all available models. Supports optional filtering by loaded=true|false|any.
@@ -336,7 +416,11 @@ async def list_models(loaded: str = "any") -> list[ModelInfo]:
 
 	# Enumerate disk.
 	names = sorted(p.name for p in MODELS_DIR.iterdir() if p.is_dir()) if MODELS_DIR.exists() else []
-	result: list[ModelInfo] = [{"name": n, "loaded": n in loaded_models} for n in names]
+	result: list[ModelInfo] = []
+	for n in names:
+		entry = loaded_models.get(n)
+		result.append({"name": n, "loaded": entry is not None,
+					   "context_length": entry["backend"].context_length() if entry is not None else None})
 	
 	# Filter by loaded state.
 	if loaded == "true":  result = [r for r in result if r["loaded"]]
@@ -348,18 +432,20 @@ async def list_models(loaded: str = "any") -> list[ModelInfo]:
 
 # Load a model into memory or refresh its ttl if it is already loaded.
 @app.post("/load")
-async def load(req: LoadReq) -> dict[str, str]:
+async def load(req: LoadReq) -> dict[str, Any]:
 	log.info(f"Request received: POST /load  model={req.model}")
 	try:
 		validate_model(req.model)
 		await ensure_loaded(req.model, req.ttl)
+		entry = loaded_models.get(req.model)
 	except Exception as e:
 		log.error(f"Request failed: POST /load  model={req.model}  {type(e).__name__}: {e}")
 		if not isinstance(e, HTTPException):
 			raise HTTPException(500, "Internal server error")
 		raise
+	context_length = entry["backend"].context_length() if entry is not None else None
 	log.info(f"Request completed: POST /load  model={req.model}")
-	return {"status": "loaded", "model": req.model}
+	return {"status": "loaded", "model": req.model, "context_length": context_length}
 
 
 # Unload a model immediately, aborting any requests currently using it.
@@ -383,27 +469,41 @@ async def unload(req: UnloadReq) -> dict[str, str]:
 	return {"status": status, "model": req.model}
 
 
-# Stream inference tokens as SSE. autoload=true loads model if absent.
+# Render a chat request through the model's template and return the prompt text, for debugging.
+@app.post("/template")
+async def template(req: TemplateReq) -> dict[str, str]:
+	log.info(f"Request received: POST /template  model={req.model}")
+	loaded_model = await pin_model("/template", req.model, req.autoload, req.ttl)
+	try:
+		prompt = await render_template(loaded_model, req.model, req)
+	except Exception as e:
+		log.error(f"Request failed: POST /template  model={req.model}  {type(e).__name__}: {e}")
+		raise
+	finally:
+		loaded_model["pinned"] -= 1
+		if not loaded_model["unloaded"]:
+			_refresh_ttl(loaded_model, req.ttl)
+	log.info(f"Request completed: POST /template  model={req.model}")
+	return {"prompt": prompt}
+
+
+# Stream inference events as SSE. autoload=true loads model if absent.
 @app.post("/run")
 async def run(req: RunReq) -> StreamingResponse:
-	log.info(f"Request received: POST /run  model={req.model}")
+	mode = "chat" if req.messages is not None else "prompt"
+	log.info(f"Request received: POST /run  model={req.model}  mode={mode}")
+	loaded_model = await pin_model("/run", req.model, req.autoload, req.ttl)
 
-	# Validate and ensure model is ready.
-	try:
-		validate_model(req.model)
-		if req.autoload:
-			await ensure_loaded(req.model, req.ttl)
-		loaded_model = loaded_models.get(req.model)
-		if loaded_model is None:
-			raise HTTPException(400, f"Model '{req.model}' is not loaded")
-		if not loaded_model["backend"].is_alive():
-			raise HTTPException(500, f"Model '{req.model}' backend has died; it will be unloaded shortly, load it again")
-		loaded_model["pinned"] += 1
-	except Exception as e:
-		log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")
-		if not isinstance(e, HTTPException):
-			raise HTTPException(500, "Internal server error")
-		raise
+	# Chat requests are rendered once up front so a model without a template, or messages the
+	# template rejects, fail with a proper HTTP 400 rather than an error event inside a 200 stream.
+	template_args = {**loaded_model["backend"].template_defaults, **req.template_args}
+	if req.messages is not None:
+		try:
+			await render_template(loaded_model, req.model, req)
+		except Exception as e:
+			loaded_model["pinned"] -= 1
+			log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")
+			raise
 
 	# Set up the inference stream.
 	ttl = req.ttl
@@ -415,34 +515,37 @@ async def run(req: RunReq) -> StreamingResponse:
 				if loaded_model["unloaded"]:
 					raise ModelUnloadedError
 				loop = asyncio.get_running_loop()
-				params = GenParams(prompt=req.prompt, max_tokens=req.max_tokens, temperature=req.temperature,
+				params = GenParams(prompt=req.prompt, messages=req.messages, tools=req.tools,
+								   template_args=template_args, stop=req.stop,
+								   max_tokens=req.max_tokens, temperature=req.temperature,
 								   top_p=req.top_p, repetition_penalty=req.repetition_penalty)
 				gen = loaded_model["backend"].generate(params)
 
-				# Pull tokens from the blocking generator off the event loop. An unload mid-stream
+				# Pull events from the blocking generator off the event loop. An unload mid-stream
 				# either breaks the backend (raising here) or is caught by the check below.
 				try:
 					while True:
-						token = await loop.run_in_executor(None, next, gen, None)
-						if token is None:
+						event = await loop.run_in_executor(None, next, gen, None)
+						if event is None:
 							break  # finished; an unload landing now does not spoil a complete answer
 						if loaded_model["unloaded"]:
 							raise ModelUnloadedError
-						token_count += 1
-						yield f"data: {json.dumps({'token': token})}\n\n"
+						if "token" in event or "reasoning" in event:
+							token_count += 1
+						yield f"data: {json.dumps(event)}\n\n"
 				finally:
 					# On client disconnect the worker thread may still be inside next(gen); closing
 					# a running generator raises, so leave it to be finalized when the thread returns.
 					if not gen.gi_running:
 						gen.close()
 
-				log.info(f"Request completed: POST /run  model={req.model}  tokens={token_count}")
+				log.info(f"Request completed: POST /run  model={req.model}  mode={mode}  chunks={token_count}")
 				yield "data: [DONE]\n\n"
 		except Exception as e:
 			# An unload races the backend failing, so it is what the client is told either way,
 			# unless the model was taken out because its backend had already died on its own.
 			if loaded_model["unloaded"] and not loaded_model["crashed"]:
-				log.info(f"Request cancelled: POST /run  model={req.model}  tokens={token_count}  (model unloaded)")
+				log.info(f"Request cancelled: POST /run  model={req.model}  chunks={token_count}  (model unloaded)")
 				error = f"Model '{req.model}' was unloaded; request cancelled after {token_count} tokens"
 			else:
 				log.error(f"Inference error ({req.model}): {e}")

@@ -42,8 +42,9 @@ def _post(url: str, body: dict[str, object]) -> None:
 		sys.exit(1)
 
 
-def cmd_run(args: argparse.Namespace) -> None:
-	body: dict[str, object] = {"model": args.model, "prompt": args.prompt}
+# Fields shared by run and chat: model selection, loading and sampling.
+def _run_body(args: argparse.Namespace) -> dict[str, object]:
+	body: dict[str, object] = {"model": args.model}
 	if args.ttl is not None:
 		body["ttl"] = args.ttl
 	if args.autoload:
@@ -56,7 +57,88 @@ def cmd_run(args: argparse.Namespace) -> None:
 		body["top_p"] = args.top_p
 	if args.repetition_penalty is not None:
 		body["repetition_penalty"] = args.repetition_penalty
+	if args.stop:
+		body["stop"] = args.stop
+	return body
 
+
+# Chat fields shared by chat and template: the message list, tools and template arguments.
+def _chat_body(args: argparse.Namespace) -> dict[str, object]:
+	messages: list[dict[str, object]] = []
+	if args.system:
+		messages.append({"role": "system", "content": args.system})
+	if args.messages:
+		messages.extend(_load_json(args.messages, list))
+	if args.user:
+		messages.append({"role": "user", "content": args.user})
+	if not messages:
+		print("Error: give at least one of --user, --system or --messages", file=sys.stderr)
+		sys.exit(2)
+	body: dict[str, object] = {"model": args.model, "messages": messages}
+	if args.autoload:
+		body["autoload"] = True
+	if args.ttl is not None:
+		body["ttl"] = args.ttl
+	if args.tools:
+		body["tools"] = _load_json(args.tools, list)
+	template_args: dict[str, object] = {}
+	if args.no_thinking:
+		template_args["enable_thinking"] = False
+	for kv in args.template_arg:
+		key, sep, raw = kv.partition("=")
+		if not sep:
+			print(f"Error: --template-arg expects key=json, got '{kv}'", file=sys.stderr)
+			sys.exit(2)
+		try:
+			template_args[key] = json.loads(raw)
+		except json.JSONDecodeError:
+			template_args[key] = raw  # bare strings are allowed as a convenience
+	if template_args:
+		body["template_args"] = template_args
+	return body
+
+
+def _load_json(path: str, expected: type) -> object:
+	try:
+		with open(path) as f:
+			data = json.load(f)
+	except (OSError, json.JSONDecodeError) as e:
+		print(f"Error: cannot read {path}: {e}", file=sys.stderr)
+		sys.exit(2)
+	if not isinstance(data, expected):
+		print(f"Error: {path} must contain a JSON {expected.__name__}", file=sys.stderr)
+		sys.exit(2)
+	return data
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+	body = _run_body(args)
+	body["prompt"] = args.prompt
+	_run(args, body)
+
+
+def cmd_chat(args: argparse.Namespace) -> None:
+	body = {**_run_body(args), **_chat_body(args)}
+	_run(args, body)
+
+
+def cmd_template(args: argparse.Namespace) -> None:
+	body = _chat_body(args)
+	req = urllib.request.Request(
+		f"{args.base}/template",
+		data=json.dumps(body).encode(),
+		headers={"Content-Type": "application/json"},
+		method="POST",
+	)
+	try:
+		with urllib.request.urlopen(req) as resp:
+			print(json.loads(resp.read())["prompt"], end="")
+	except urllib.error.HTTPError as e:
+		_print_http_error(e)
+		sys.exit(1)
+
+
+def _run(args: argparse.Namespace, body: dict[str, object]) -> None:
 	req = urllib.request.Request(
 		f"{args.base}/run",
 		data=json.dumps(body).encode(),
@@ -65,33 +147,67 @@ def cmd_run(args: argparse.Namespace) -> None:
 	)
 	try:
 		with urllib.request.urlopen(req) as resp:
-			_stream_sse(resp)
+			_stream_sse(resp, raw=args.json)
 	except urllib.error.HTTPError as e:
 		_print_http_error(e)
 		sys.exit(1)
 
 
-def _stream_sse(resp: http.client.HTTPResponse) -> None:
+# Print a stream of events. Answer text goes to stdout as it arrives; reasoning, the stop reason
+# and token usage go to stderr so stdout holds only the answer (plus tool calls as JSON, if any).
+# With raw=True every event is printed to stdout as one JSON line instead.
+def _stream_sse(resp: http.client.HTTPResponse, raw: bool) -> None:
 	# buf collects pre-SSE lines (e.g. an error body); set to None once SSE begins.
 	buf: list[str] | None = []
 	failed = False
-	for raw in resp:
-		line = raw.decode().rstrip("\n")
+	reasoning_open = False
+	printed = False
+	for line_bytes in resp:
+		line = line_bytes.decode().rstrip("\n")
 		if line.startswith("data: "):
 			buf = None
 			data = line[6:]
 			if data == "[DONE]":
-				print()
+				if not raw and printed:
+					print()
 				break
 			try:
 				d = json.loads(data)
-				if "token" in d:
-					print(d["token"], end="", flush=True)
-				elif "error" in d:
-					print(f"\nError: {d['error']}", file=sys.stderr)
-					failed = True
 			except json.JSONDecodeError:
-				pass
+				continue
+			if raw:
+				print(json.dumps(d), flush=True)
+				continue
+			if "reasoning" in d:
+				if not reasoning_open:
+					print("[thinking] ", end="", file=sys.stderr)
+					reasoning_open = True
+				print(d["reasoning"], end="", file=sys.stderr, flush=True)
+			elif "token" in d:
+				if reasoning_open:
+					print(file=sys.stderr)
+					reasoning_open = False
+				print(d["token"], end="", flush=True)
+				printed = True
+			elif "tool_calls" in d:
+				if reasoning_open:
+					print(file=sys.stderr)
+					reasoning_open = False
+				if printed:
+					print()
+				print(json.dumps({"tool_calls": d["tool_calls"]}, indent=2))
+				printed = False
+			elif "stop_reason" in d:
+				if reasoning_open:
+					print(file=sys.stderr)
+					reasoning_open = False
+				print(f"[stop_reason: {d['stop_reason']}]", file=sys.stderr)
+			elif "usage" in d:
+				u = d["usage"]
+				print(f"[usage: prompt={u.get('prompt_tokens')} completion={u.get('completion_tokens')} context={u.get('context_length')}]", file=sys.stderr)
+			elif "error" in d:
+				print(f"\nError: {d['error']}", file=sys.stderr)
+				failed = True
 		elif buf is not None and line.strip():
 			buf.append(line)
 	if buf:
@@ -112,6 +228,28 @@ def _print_error_body(raw: str):
 		print(f"Error: {raw}", file=sys.stderr)
 
 
+def _add_run_args(p: argparse.ArgumentParser) -> None:
+	p.add_argument("--model", required=True)
+	p.add_argument("--ttl", type=float, default=None)
+	p.add_argument("--autoload", action="store_true")
+	p.add_argument("--max-tokens", type=int, default=None, dest="max_tokens")
+	p.add_argument("--temperature", type=float, default=None)
+	p.add_argument("--top-p", type=float, default=None, dest="top_p")
+	p.add_argument("--repetition-penalty", type=float, default=None, dest="repetition_penalty")
+	p.add_argument("--stop", action="append", default=[], help="stop sequence; repeatable")
+	p.add_argument("--json", action="store_true", help="print raw events, one JSON object per line")
+
+
+def _add_chat_args(p: argparse.ArgumentParser) -> None:
+	p.add_argument("--system", default=None, help="system prompt, placed first")
+	p.add_argument("--messages", default=None, help="JSON file with a list of prior messages")
+	p.add_argument("--user", default=None, help="user message, placed last")
+	p.add_argument("--tools", default=None, help="JSON file with a list of OpenAI-style tool schemas")
+	p.add_argument("--no-thinking", action="store_true", dest="no_thinking", help="template_args.enable_thinking=false")
+	p.add_argument("--template-arg", action="append", default=[], dest="template_arg", metavar="KEY=JSON",
+				   help="extra chat-template argument; repeatable")
+
+
 def main():
 	parser = argparse.ArgumentParser(prog="llm")
 	parser.add_argument("--host", default="localhost")
@@ -128,20 +266,25 @@ def main():
 	p_unload = sub.add_parser("unload")
 	p_unload.add_argument("--model", required=True)
 
-	p_run = sub.add_parser("run")
-	p_run.add_argument("--model", required=True)
+	p_run = sub.add_parser("run", help="raw completion of a prompt")
+	_add_run_args(p_run)
 	p_run.add_argument("--prompt", required=True)
-	p_run.add_argument("--ttl", type=float, default=None)
-	p_run.add_argument("--autoload", action="store_true")
-	p_run.add_argument("--max-tokens", type=int, default=None, dest="max_tokens")
-	p_run.add_argument("--temperature", type=float, default=None)
-	p_run.add_argument("--top-p", type=float, default=None, dest="top_p")
-	p_run.add_argument("--repetition-penalty", type=float, default=None, dest="repetition_penalty")
+
+	p_chat = sub.add_parser("chat", help="chat completion through the model's template")
+	_add_run_args(p_chat)
+	_add_chat_args(p_chat)
+
+	p_template = sub.add_parser("template", help="print the prompt a chat request renders to")
+	p_template.add_argument("--model", required=True)
+	p_template.add_argument("--ttl", type=float, default=None)
+	p_template.add_argument("--autoload", action="store_true")
+	_add_chat_args(p_template)
 
 	args = parser.parse_args()
 	args.base = f"http://{args.host}:{args.port}"
+	commands = {"list": cmd_list, "load": cmd_load, "unload": cmd_unload, "run": cmd_run, "chat": cmd_chat, "template": cmd_template}
 	try:
-		{"list": cmd_list, "load": cmd_load, "unload": cmd_unload, "run": cmd_run}[args.cmd](args)
+		commands[args.cmd](args)
 	except urllib.error.URLError as e:
 		if isinstance(e.reason, OSError) and e.reason.errno is not None:
 			print(f"Error {e.reason.errno}: could not connect to server at {args.base} ({e.reason.strerror})", file=sys.stderr)

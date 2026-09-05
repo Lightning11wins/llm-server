@@ -64,8 +64,11 @@ Every model directory **must** contain a `model.json` naming its backend. Direct
 ```
 
 - `model` (required): GGUF filename inside the model directory.
-- `args` (optional): extra `llama-server` flags. The server always sets `-m`, `--host 127.0.0.1`, `--port <free port>` and `--no-webui`, and rejects configs that try to override them. Run `bin/llama.cpp/llama-server --help` for the full list. Useful ones: `-ngl N` (layers on GPU), `-c N` (context size), `-fa on` (flash attention), `--n-cpu-moe N` (keep the first N layers' MoE experts in CPU RAM), `-ctk q8_0 -ctv q8_0` (quantized KV cache), `--fit on` (auto-tune to fit device memory).
+- `args` (optional): extra `llama-server` flags. The server always sets `-m`, `--host 127.0.0.1`, `--port <free port>`, `--no-webui` and `--jinja`, and rejects configs that try to override them. Run `bin/llama.cpp/llama-server --help` for the full list. Useful ones: `-ngl N` (layers on GPU), `-c N` (context size), `-fa on` (flash attention), `--n-cpu-moe N` (keep the first N layers' MoE experts in CPU RAM), `-ctk q8_0 -ctv q8_0` (quantized KV cache), `--fit on` (auto-tune to fit device memory), `--reasoning-budget N` (cap thinking tokens).
 - `startup_timeout` (optional, seconds): how long to wait for the model to load. Default 300.
+- `template_defaults` (optional, any backend): chat-template arguments applied to every chat request unless the request's `template_args` overrides them, e.g. `{"enable_thinking": false}` to make a Qwen model answer without thinking by default.
+
+Chat requests use the chat template embedded in the GGUF. `llama-server` renders it, separates the model's thinking into `reasoning` events and parses tool calls into `tool_calls` events.
 
 Each subprocess logs to `logs/llama-<model>-<timestamp>.log`.
 
@@ -102,6 +105,8 @@ For the MoE model: `--n-cpu-moe N` keeps the experts of the first N of 40 layers
 
 The directory must be a standard HuggingFace model directory: `config.json`, tokenizer files, and weight files. It is loaded with `device_map="auto"`.
 
+Chat requests are rendered with the tokenizer's chat template. A model whose tokenizer has none (GPT-2) accepts raw prompts only and answers chat requests with HTTP 400. This backend does not split reasoning or tool calls out of the output: whatever the model prints arrives as `token` events.
+
 ## Start
 
 To start, simply run `./run.sh` in the project directory. This sets up the AppArmor profile and Python environment automatically, asking before anything that needs `sudo` or downloads packages.
@@ -127,8 +132,10 @@ GET /list?loaded=any|true|false
 ```
 
 ```json
-[{"name": "qwen3.5-9b", "loaded": true}, ...]
+[{"name": "qwen3.5-9b", "loaded": true, "context_length": 8192}, ...]
 ```
+
+`context_length` is the total number of tokens (prompt plus completion) the loaded model accepts; `null` when the model is not loaded. For `llama-cpp` it is the per-slot context (`-c` divided by the number of parallel slots).
 
 ### POST /load
 
@@ -138,7 +145,7 @@ GET /list?loaded=any|true|false
 
 Blocks until loaded. If already loaded, refreshes TTL. `ttl` (seconds) defaults to 300.
 
-Returns `{"status": "loaded", "model": "qwen3.5-9b"}`. Returns HTTP 409 if the model is unloaded while this load is in flight.
+Returns `{"status": "loaded", "model": "qwen3.5-9b", "context_length": 8192}`. Returns HTTP 409 if the model is unloaded while this load is in flight.
 
 ### POST /unload
 
@@ -161,10 +168,13 @@ Unloading is idempotent, so any of these is a success. HTTP 404 is returned only
 
 ### POST /run
 
+Generates from either a raw `prompt` or a chat `messages` list; exactly one of the two is required.
+
 ```json
 {
   "model": "qwen3.5-9b",
   "prompt": "Hello",
+  "stop": ["\n\n"],
   "ttl": 300,
   "autoload": false,
   "max_tokens": 512,
@@ -174,16 +184,64 @@ Unloading is idempotent, so any of these is a success. HTTP 404 is returned only
 }
 ```
 
-Required: `model`, `prompt`. If `autoload=true`, `ttl` is also required. All other fields optional.
-
-Streams `text/event-stream`:
+```json
+{
+  "model": "qwen3.5-9b",
+  "messages": [
+    {"role": "system", "content": "You are a terse sysadmin assistant."},
+    {"role": "user", "content": "How much disk is free?"}
+  ],
+  "tools": [
+    {"type": "function", "function": {
+      "name": "run_shell",
+      "description": "Run a shell command and return its output",
+      "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
+    }}
+  ],
+  "template_args": {"enable_thinking": false},
+  "stop": [],
+  "max_tokens": 512
+}
 ```
-data: {"token": "Hello"}
-data: {"token": " there"}
+
+- `prompt`: raw text, fed to the model as is. No template, no special tokens.
+- `messages`: OpenAI-style chat messages, rendered server-side through the model's chat template. Roles `system`, `user`, `assistant` and `tool` mean what the template says they mean; the server only checks that each message has a string `role`. Messages that the template rejects return HTTP 400 with the template's error.
+- `tools` (chat only): OpenAI function schemas. When the model decides to call one, the stream ends with a `tool_calls` event and `stop_reason` `tool`.
+- `template_args` (chat only): extra variables for the chat template, merged over the model's `template_defaults`. `{"enable_thinking": false}` turns thinking off on Qwen models. Every model family spells these differently, so nothing here is interpreted by the server.
+- `stop`: up to 16 strings; generation ends when the output ends with one. The stop string itself is omitted from the output on `llama-cpp` and included on `transformers`.
+- `ttl`, `autoload`, `max_tokens`, `temperature`, `top_p`, `repetition_penalty`: as before. `max_tokens` covers thinking and answer together.
+
+Streams `text/event-stream`. Each event has exactly one key:
+
+```
+data: {"reasoning": "The user wants"}        model's thinking, chat mode only, when the template separates it
+data: {"token": "Hello"}                     answer text
+data: {"tool_calls": [{"id": "...", "type": "function", "function": {"name": "run_shell", "arguments": "{\"command\":\"df -h\"}"}}]}
+data: {"stop_reason": "eos"}                 eos | length | stop | tool
+data: {"usage": {"prompt_tokens": 281, "completion_tokens": 26, "context_length": 8192}}
 data: [DONE]
 ```
 
+`token` and `reasoning` events stream as generated; `tool_calls`, `stop_reason` and `usage` arrive once at the end, in that order. `arguments` is a JSON string, as in the OpenAI API. `stop_reason` `eos` means the model ended its turn, `length` that `max_tokens` was hit, `stop` that a `stop` string matched, `tool` that the model requested tool calls. In chat mode on `llama-cpp` a matched stop string is reported as `eos`, since `llama-server` does not distinguish the two there.
+
 On mid-stream error: `data: {"error": "..."}` then stream closes.
+
+#### Writing a harness
+
+The server is stateless: send the whole conversation every turn. `llama-server` caches the KV state of the common prefix, so a growing history costs prompt processing only for the new tail.
+
+1. Send `messages` (and `tools`) and collect the stream. Concatenate `token` fragments into `content` and `reasoning` fragments into `reasoning_content`.
+2. Append the assistant turn to your history **including `reasoning_content` and `tool_calls`**: `{"role": "assistant", "content": "...", "reasoning_content": "...", "tool_calls": [...]}`. The template decides what to keep; Qwen's drops reasoning from all but the latest turn. If you drop it yourself, the prompt no longer matches what the model produced and the KV cache is invalidated.
+3. If `stop_reason` was `tool`, run each call and append `{"role": "tool", "tool_call_id": "<id>", "content": "<result>"}` per call, then go to 1.
+4. Watch `usage.prompt_tokens` against `usage.context_length` and truncate your history before it no longer fits. The server does not truncate for you; a prompt that overflows the context fails.
+
+### POST /template
+
+```json
+{"model": "qwen3.5-9b", "messages": [...], "tools": [...], "template_args": {}, "autoload": false, "ttl": 300}
+```
+
+Returns `{"prompt": "<|im_start|>system\n..."}`: the exact text a `/run` with the same fields would feed the model. For checking what a template does with your messages. Same validation and errors as `/run` in chat mode.
 
 ## llm CLI
 
@@ -191,8 +249,22 @@ On mid-stream error: `data: {"error": "..."}` then stream closes.
 ./llm [--host <h>] [--port <p>] list [--loaded true|false|any]
 ./llm load   --model <name> [--ttl <s>]
 ./llm unload --model <name>
-./llm run    --model <name> --prompt <text> [--autoload --ttl <s>] \
-             [--max-tokens <n>] [--temperature <f>] [--top-p <f>] [--repetition-penalty <f>]
+./llm run    --model <name> --prompt <text> [<generation flags>]
+./llm chat   --model <name> [--system <text>] [--messages <file.json>] [--user <text>] \
+             [--tools <file.json>] [--no-thinking] [--template-arg key=json ...] [<generation flags>]
+./llm template --model <name> [--system ...] [--messages ...] [--user ...] [--tools ...] [--no-thinking] [--autoload --ttl <s>]
+
+# generation flags:
+  [--autoload --ttl <s>] [--max-tokens <n>] [--temperature <f>] [--top-p <f>] [--repetition-penalty <f>]
+  [--stop <text> ...] [--json]
+```
+
+`chat` builds the message list as `--system`, then the contents of `--messages` (a JSON list, e.g. a saved history), then `--user`. Answer text goes to stdout; thinking, `stop_reason` and `usage` go to stderr; tool calls are printed to stdout as JSON. `--json` prints every event as one JSON line instead. `--no-thinking` is shorthand for `--template-arg enable_thinking=false`.
+
+```bash
+./llm chat --model qwen3.5-9b --autoload --ttl 600 --no-thinking --user "What is 2+2?"
+./llm chat --model qwen3.5-9b --tools tools.json --user "What is the weather in Paris?" --json
+./llm template --model qwen3.5-9b --system "Be brief." --user "Hi"
 ```
 
 ## Testing
@@ -202,18 +274,9 @@ On mid-stream error: `data: {"error": "..."}` then stream closes.
 ./run-tests.sh qwen3.5-9b     # just the named models
 ```
 
+Per model this covers raw and stop-string completion, template rendering, chat with and without thinking, a tool call, TTL eviction and unload mid-generation. Models without a chat template must refuse chat mode.
+
 When the AppArmor profile is loaded, this offers to reload it in complain mode for the run (needs `sudo`), so a rule that is too tight is reported at the end rather than breaking a test in the middle, and puts it back in enforce mode afterwards. Any reported denial fails the run. Complain mode applies to every process under the profile, so the script refuses to start while a `./run.sh` server is running.
-
-## TODO
-
-The prompt is passed to the model as raw text. Instruction-tuned models (Qwen etc.) need the following to be useful; none of it exists yet:
-
-- Chat-formatted input (a `messages` list) with the model's chat template applied server-side. `llama-server` exposes `/apply-template` and `/v1/chat/completions` for this.
-- Thinking mode on/off (a chat-template argument on Qwen models).
-- Stop sequences and end-of-turn handling. Raw completion runs to `max_tokens` or the model's EOS.
-- Tool-call schemas in requests and parsed tool calls in responses.
-- System prompt support (also a chat-template concern).
-- Context window / prompt-length reporting so a client knows when to truncate.
 
 ## Developer Notes
 
@@ -221,6 +284,10 @@ The prompt is passed to the model as raw text. Instruction-tuned models (Qwen et
 - **`model.json` is required** — a directory without a valid one returns HTTP 400 on load/run with the reason.
 - **Model names** may contain letters, digits, `.`, `_` and `-`, and may not start with a dot.
 - **Sampling defaults differ per backend** — `transformers` samples with only the parameters the API sets; `llama-server` additionally applies its own defaults (`top_k 40`, `min_p 0.05`) unless overridden in `args`.
+- **Chat mode is two different code paths** — `llama-cpp` proxies `/v1/chat/completions` (and `/apply-template` for `/template`), so template rendering, reasoning extraction and tool-call parsing are all `llama-server`'s. `transformers` renders with `apply_chat_template` and streams the raw output. The server owns nothing model-specific: it validates shapes, merges `template_defaults`, and relays events.
+- **Chat requests are rendered twice on `llama-cpp`** — once through `/apply-template` before streaming starts, so bad messages fail with HTTP 400 instead of an error event inside a 200 stream, and again inside `/v1/chat/completions`. Rendering is milliseconds; the KV cache is untouched by the first pass.
+- **Thinking counts against `max_tokens`** — a Qwen model left to think may spend most of a small budget on reasoning and end with `stop_reason` `length` and no answer. Turn thinking off with `template_args`, raise `max_tokens`, or cap it with `--reasoning-budget N` in the model's `args`.
+- **Reasoning is only separated when the template does it** — `llama-server` extracts `<think>` blocks in chat mode. In raw `prompt` mode, and on the `transformers` backend, the tags arrive inline as `token` events.
 - **`do_sample=True` is always set** on the transformers backend — generation is always stochastic.
 - **`device_map="auto"` silently spills to CPU** on the transformers backend — if a model exceeds available VRAM, layers overflow to system RAM with no error, making inference much slower. Use the `llama-cpp` backend for anything that does not fit in VRAM.
 - **Unloading a `llama-cpp` model kills its subprocess**, which frees VRAM fully. Unloading a `transformers` model frees the tensors but the CUDA context stays resident in this process (a few hundred MB).
