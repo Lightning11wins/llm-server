@@ -33,7 +33,14 @@ LOGS_DIR         = BASE_DIR / "logs"
 DEFAULT_STARTUP_TIMEOUT = 300   # seconds
 HEALTH_POLL_INTERVAL    = 0.5   # seconds
 SHUTDOWN_GRACE          = 10    # seconds between SIGTERM and SIGKILL
-READ_TIMEOUT            = 60    # seconds to wait for the next streamed token
+SSE_PING_INTERVAL       = 15    # seconds; llama-server emits SSE comments at this rate while silent (e.g. prompt processing)
+READ_TIMEOUT            = 60    # seconds without any bytes (token or ping) before the stream is considered dead
+
+# Flags the server sets itself; letting model.json override them would break the health check/proxy.
+RESERVED_ARGS = {"-m", "--model", "--host", "--port", "--no-webui", "--webui"}
+
+_libc = ctypes.CDLL(None, use_errno=True)  # resolved once at import so the forked child makes a single C call
+PR_SET_PDEATHSIG = 1
 
 
 def _free_port() -> int:
@@ -43,12 +50,13 @@ def _free_port() -> int:
 
 
 def _die_with_parent() -> None:
-	"""preexec_fn: ask Linux to SIGKILL the child if this server process dies."""
-	try:
-		PR_SET_PDEATHSIG = 1
-		ctypes.CDLL("libc.so.6").prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-	except Exception:
-		pass  # best effort; unload() still handles the normal path
+	"""preexec_fn: ask Linux to SIGKILL the child when the parent goes away.
+
+	PR_SET_PDEATHSIG fires when the *thread* that forked exits. load() runs on an asyncio default
+	executor worker; those threads live until interpreter shutdown, so in practice this means
+	"when the server process exits", including crashes and SIGKILL. unload() is the normal path.
+	"""
+	_libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
 class LlamaCppBackend(Backend):
@@ -70,6 +78,9 @@ class LlamaCppBackend(Backend):
 		args = config.get("args", [])
 		if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
 			raise ModelConfigError("'args' must be a list of strings")
+		reserved = RESERVED_ARGS.intersection(a.split("=", 1)[0] for a in args)
+		if reserved:
+			raise ModelConfigError(f"'args' may not set {', '.join(sorted(reserved))}; the server sets these itself")
 		self.args: list[str] = args
 
 		timeout = config.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
@@ -130,6 +141,9 @@ class LlamaCppBackend(Backend):
 				proc.wait()
 		self._cleanup()
 
+	def is_alive(self) -> bool:
+		return self.proc is not None and self.proc.poll() is None
+
 	def _cleanup(self) -> None:
 		if self.log_file is not None:
 			self.log_file.close()
@@ -143,7 +157,7 @@ class LlamaCppBackend(Backend):
 		return f"See {self.log_path.name}:\n" + "\n".join(tail)
 
 	def generate(self, params: GenParams) -> Iterator[str]:
-		if self.proc is None or self.proc.poll() is not None:
+		if not self.is_alive():
 			raise RuntimeError("llama-server subprocess is not running")
 
 		body = {
@@ -154,6 +168,7 @@ class LlamaCppBackend(Backend):
 			"repeat_penalty": params.repetition_penalty,
 			"stream": True,
 			"cache_prompt": True,
+			"sse_ping_interval": SSE_PING_INTERVAL,  # keeps READ_TIMEOUT from firing during long prompt processing
 		}
 		with requests.post(f"{self.base_url}/completion", json=body, stream=True, timeout=(5, READ_TIMEOUT)) as resp:
 			if not resp.ok:

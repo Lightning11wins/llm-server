@@ -5,7 +5,7 @@ import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TypedDict
+from typing import Callable, TypedDict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -75,34 +75,39 @@ loaded_models: dict[str, LoadedModel] = {}
 load_lock = asyncio.Lock()  # serialized model loading
 
 
-# Evict when TTL expires.
+# A model may be evicted when nothing is using it and it has either expired or its backend has died.
+def _evictable(entry: LoadedModel) -> bool:
+	idle = not entry["lock"].locked() and entry["pinned"] == 0
+	return idle and (time.time() >= entry["ttl_end"] or not entry["backend"].is_alive())
+
+
+# Evict models whose TTL has expired or whose backend has died.
 async def ttl_monitor() -> None:
 	while True:
 		await asyncio.sleep(TTL_MONITOR_INTERVAL)
-		
-		# Collect models to evict.
-		now = time.time()
-		expired = [
-			n for n, e in list(loaded_models.items())
-			if now >= e["ttl_end"] and not e["lock"].locked() and e["pinned"] == 0
-		]
-		
-		# Evict.
-		for name in expired:
-			await unload_model(name)
+		for name in list(loaded_models):
+			await unload_model(name, only_if_evictable=True)
 
 
 # Remove a model from the registry and release its resources.
-async def unload_model(name: str) -> None:
-	entry = loaded_models.pop(name, None)
-	if entry is None:
+# Serialized with loading via load_lock, so a new model never starts loading while an old one is
+# still releasing GPU memory. With only_if_evictable=True the model is left alone unless it is idle
+# and expired/dead; the check is repeated under the lock because a request may have started meanwhile.
+async def unload_model(name: str, *, only_if_evictable: bool = False) -> None:
+	entry = loaded_models.get(name)
+	if entry is None or (only_if_evictable and not _evictable(entry)):
 		return
-	loop = asyncio.get_running_loop()
-	try:
-		await loop.run_in_executor(None, entry["backend"].unload)
-	except Exception as e:
-		log.error(f"Error unloading {name}: {type(e).__name__}: {e}")
-	log.info(f"Model unloaded: {name}")
+	async with load_lock:
+		entry = loaded_models.get(name)
+		if entry is None or (only_if_evictable and not _evictable(entry)):
+			return
+		del loaded_models[name]
+		loop = asyncio.get_running_loop()
+		try:
+			await loop.run_in_executor(None, entry["backend"].unload)
+		except Exception as e:
+			log.error(f"Error unloading {name}: {type(e).__name__}: {e}")
+		log.info(f"Model unloaded: {name}")
 
 
 # Setup model manager.
@@ -139,6 +144,20 @@ async def validation_exc_handler(request: Request, exc: RequestValidationError) 
 async def generic_exc_handler(request: Request, exc: Exception) -> JSONResponse:
 	log.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
 	return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+
+# A StreamingResponse that always runs `finalizer` once the response is finished or abandoned,
+# even when the body iterator was never started (client gone before the first chunk).
+class FinalizedStreamingResponse(StreamingResponse):
+	def __init__(self, content, finalizer: Callable[[], None], **kwargs) -> None:
+		super().__init__(content, **kwargs)
+		self._finalizer = finalizer
+
+	async def __call__(self, scope, receive, send) -> None:
+		try:
+			await super().__call__(scope, receive, send)
+		finally:
+			self._finalizer()
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
@@ -183,17 +202,21 @@ def _refresh_ttl(registered_model: LoadedModel, ttl: float) -> None:
 # Ensure that a model is loaded, updating the model TTL as needed.
 # Note: Loads are serialized via load_lock.
 async def ensure_loaded(name: str, ttl: float) -> None:
-	# Early exit if already loaded.
-	if name in loaded_models:
-		_refresh_ttl(loaded_models[name], ttl)
-		return
-	
+	# Early exit if already loaded. A dead backend (crashed subprocess) is unloaded and reloaded.
+	entry = loaded_models.get(name)
+	if entry is not None:
+		if entry["backend"].is_alive():
+			_refresh_ttl(entry, ttl)
+			return
+		log.error(f"Model backend died, reloading: {name}")
+		await unload_model(name)
+
 	async with load_lock:
 		# Re-check for loaded model.
 		if name in loaded_models:
 			_refresh_ttl(loaded_models[name], ttl)
 			return
-		
+
 		# Build the backend from model.json and load it off the event loop.
 		try:
 			backend = create_backend(name, MODELS_DIR / name)
@@ -263,6 +286,8 @@ async def run(req: RunReq) -> StreamingResponse:
 		loaded_model = loaded_models.get(req.model)
 		if loaded_model is None:
 			raise HTTPException(400, f"Model '{req.model}' is not loaded")
+		if not loaded_model["backend"].is_alive():
+			raise HTTPException(500, f"Model '{req.model}' backend has died; it will be unloaded shortly, load it again")
 		loaded_model["pinned"] += 1
 	except Exception as e:
 		log.error(f"Request failed: POST /run  model={req.model}  {type(e).__name__}: {e}")
@@ -294,11 +319,14 @@ async def run(req: RunReq) -> StreamingResponse:
 		except Exception as e:
 			log.error(f"Inference error ({req.model}): {e}")
 			yield f"data: {json.dumps({'error': str(e)})}\n\n"
-		finally:
-			loaded_model["pinned"] -= 1
-			_refresh_ttl(loaded_model, ttl)
 
-	return StreamingResponse(stream(), media_type="text/event-stream")
+	# Unpin from the response's finalizer rather than the generator's `finally`: if the client
+	# disconnects before streaming starts, the generator is never entered and its `finally` never runs.
+	def release() -> None:
+		loaded_model["pinned"] -= 1
+		_refresh_ttl(loaded_model, ttl)
+
+	return FinalizedStreamingResponse(stream(), release, media_type="text/event-stream")
 
 
 # Start server.
