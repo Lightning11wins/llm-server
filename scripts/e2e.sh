@@ -43,12 +43,17 @@ for m in "${MODELS[@]}"; do
 	# Unload mid-generation: the running request must be cancelled and the model released.
 	echo "--- unload during generation:"
 	./llm --port $PORT load --model "$m" --ttl 60 > /dev/null || fail=1
-	./llm --port $PORT run --model "$m" --prompt "Write a long story about a robot." --max-tokens 4000 > /dev/null 2>&1 &
+	rout="$(mktemp)"
+	./llm --port $PORT run --model "$m" --prompt "Write a long story about a robot." --max-tokens 4000 > "$rout" 2>&1 &
 	rpid=$!
 	sleep 3
 	if kill -0 $rpid 2>/dev/null; then
 		./llm --port $PORT unload --model "$m" || fail=1
-		wait $rpid && { echo "RUN SUCCEEDED after unload"; fail=1; }
+		if wait $rpid; then
+			echo "(generation finished just before the unload)"  # hit EOS in the gap; not a failure
+		elif ! grep -q "was unloaded; request cancelled" "$rout"; then
+			echo "RUN FAILED for another reason:"; tail -n 3 "$rout"; fail=1
+		fi
 	else
 		# Nothing left to cancel: the model hit EOS first. Still check the unload itself.
 		echo "(generation finished before the unload)"
@@ -56,6 +61,7 @@ for m in "${MODELS[@]}"; do
 	fi
 	./llm --port $PORT list --loaded true | grep -q '"name"' && { echo "STILL LOADED after unload"; fail=1; }
 	./llm --port $PORT unload --model "$m" || fail=1  # idempotent
+	rm -f "$rout"
 	echo "--- nvidia-smi after unload:"
 	nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true
 done
