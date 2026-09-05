@@ -9,16 +9,30 @@ import threading
 from typing import Iterator
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 
 from . import Backend, GenParams
 
 STREAMER_TIMEOUT = 60  # seconds to wait for the next token before giving up
 
 
+# Ends generation at the next token once `event` is set, so unload() can stop a running generate.
+class _StopOnEvent(StoppingCriteria):
+	def __init__(self, event: threading.Event) -> None:
+		self.event = event
+
+	def __call__(self, input_ids, scores, **kwargs) -> torch.BoolTensor:
+		return torch.full((input_ids.shape[0],), self.event.is_set(), device=input_ids.device, dtype=torch.bool)  # type: ignore[return-value]
+
+
 class TransformersBackend(Backend):
 	model: PreTrainedModel | None = None
 	tokenizer: PreTrainedTokenizerBase | None = None
+	_thread: threading.Thread | None = None  # the generate thread of the latest request, if any
+
+	def __init__(self, *args, **kwargs) -> None:
+		super().__init__(*args, **kwargs)
+		self._stop = threading.Event()
 
 	def load(self) -> None:
 		path = str(self.model_dir)
@@ -29,6 +43,13 @@ class TransformersBackend(Backend):
 		self.model = AutoModelForCausalLM.from_pretrained(path, device_map="auto")
 
 	def unload(self) -> None:
+		# The generate thread holds references to the model, so nothing is freed until it exits.
+		# Stop it at its next token and wait, so the VRAM is actually returned before we report done.
+		self._stop.set()
+		thread = self._thread
+		if thread is not None:
+			thread.join()
+		self._thread = None
 		self.model = None
 		self.tokenizer = None
 		gc.collect()
@@ -45,8 +66,10 @@ class TransformersBackend(Backend):
 			target=model.generate,  # type: ignore[arg-type]
 			kwargs=dict(**inputs, streamer=streamer, max_new_tokens=params.max_tokens,
 						temperature=params.temperature, top_p=params.top_p,
-						repetition_penalty=params.repetition_penalty, do_sample=True),
+						repetition_penalty=params.repetition_penalty, do_sample=True,
+						stopping_criteria=StoppingCriteriaList([_StopOnEvent(self._stop)])),
 			daemon=True,
 		)
+		self._thread = thread
 		thread.start()
 		yield from streamer
