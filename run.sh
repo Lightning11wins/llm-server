@@ -15,7 +15,6 @@ PROFILE=llm-server
 AA="AppArmor profile '$PROFILE'"
 SRC=apparmor/$PROFILE
 INSTALLED=/etc/apparmor.d/$PROFILE
-STAMP=$ROOT/.apparmor-loaded
 PYTHON=venv/bin/python
 KERNEL_PROFILES=/sys/kernel/security/apparmor/profiles
 
@@ -40,16 +39,13 @@ confirm() {
 	[[ $answer == [yY]* ]]
 }
 
-# Symlink rather than copy, so editing apparmor/llm-server updates the
-# installed profile and only the reload is a separate step. The stamp records
-# what was last pushed into the kernel; see the reload check below.
+# A root-owned copy, not a symlink into this checkout. apparmor.service loads
+# everything under /etc/apparmor.d at boot, and a symlink there would let
+# anyone who can write to this directory author system-wide policy as root.
 install_profile() {
-	sudo ln -sfn "$ROOT/$SRC" "$INSTALLED" \
-		&& sudo apparmor_parser -r "$INSTALLED" \
-		&& profile_hash > "$STAMP"
+	sudo install -m 0644 -o root -g root "$SRC" "$INSTALLED" \
+		&& sudo apparmor_parser -r "$INSTALLED"
 }
-
-profile_hash() { sha256sum "$SRC" | cut -d' ' -f1; }
 
 # Create the venv and install requirements if they are not there yet. torch is
 # deliberately left out: which wheel is right depends on the local CUDA
@@ -80,34 +76,28 @@ command -v aa-exec > /dev/null || die "aa-exec not found. Install the apparmor p
 [ "$(aa-enabled 2> /dev/null)" = "Yes" ] || die "AppArmor is not enabled on this kernel (aa-enabled: $(aa-enabled 2>&1)). Run ./run.sh --unconfined to start without it"
 [ -e "$SRC" ] || die "$SRC is missing from this checkout"
 
-# --- profile installed, current, and pushed into the kernel ----------------
+# The profile hardcodes the checkout path. A mismatch makes every file rule
+# silently deny instead of match, which looks like a pile of unrelated bugs.
+profile_dir=$(sed -n 's/^@{LLM_DIR}[[:space:]]*=[[:space:]]*//p' "$SRC")
+if [ "$profile_dir" != "$ROOT" ]; then
+	confirm "$SRC sets @{LLM_DIR} to '$profile_dir' but this checkout is at '$ROOT'. Update it?" \
+		|| die "declined; fix the @{LLM_DIR} line in $SRC"
+	sed -i "s|^@{LLM_DIR}[[:space:]]*=.*|@{LLM_DIR} = $ROOT|" "$SRC" || die "could not edit $SRC"
+fi
+
+# --- profile installed and current -----------------------------------------
+# The installed file is a copy, so a difference from $SRC means an edit that
+# has not been installed and loaded yet.
 reason=""
 if [ ! -e "$INSTALLED" ]; then
 	reason="the $AA is not installed"
 elif ! cmp -s "$SRC" "$INSTALLED"; then
-	# A stale copy from before the symlink install.
 	reason="$INSTALLED does not match $SRC"
-elif [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$(profile_hash)" ]; then
-	# The install is a symlink, so an edit to $SRC changes both sides of the
-	# cmp above and cannot be spotted that way. The only way to notice an edit
-	# that was never pushed into the kernel is to remember what was last
-	# loaded, which is what $STAMP is for.
-	reason="$SRC has changed since it was last loaded into the kernel"
 fi
 if [ -n "$reason" ]; then
 	confirm "$reason. Install it to $INSTALLED and load it (needs sudo)?" \
 		|| die "declined; nothing to run under"
 	install_profile || die "could not load the profile"
-fi
-
-# The profile hardcodes the checkout path. A mismatch makes every file rule
-# silently deny instead of match, which looks like a pile of unrelated bugs.
-profile_dir=$(sed -n 's/^@{LLM_DIR}[[:space:]]*=[[:space:]]*//p' "$SRC")
-if [ "$profile_dir" != "$ROOT" ]; then
-	confirm "$SRC sets @{LLM_DIR} to '$profile_dir' but this checkout is at '$ROOT'. Update it and reload (needs sudo)?" \
-		|| die "declined; fix the @{LLM_DIR} line in $SRC"
-	sed -i "s|^@{LLM_DIR}[[:space:]]*=.*|@{LLM_DIR} = $ROOT|" "$SRC" || die "could not edit $SRC"
-	install_profile || die "reload failed"
 fi
 
 # --- profile loaded into the kernel ----------------------------------------
