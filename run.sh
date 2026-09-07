@@ -15,6 +15,7 @@ PROFILE=llm-server
 AA="AppArmor profile '$PROFILE'"
 SRC=apparmor/$PROFILE
 INSTALLED=/etc/apparmor.d/$PROFILE
+TUNABLE=/etc/apparmor.d/tunables/$PROFILE
 PYTHON=venv/bin/python
 AA_FEATURES=/sys/kernel/security/apparmor/features
 
@@ -76,6 +77,14 @@ install_profile() {
 	fi
 }
 
+# The profile reads the checkout path from a tunable, so the profile file itself
+# is the same on every machine and $SRC never needs a local edit. The tunable
+# is a one-line root-owned file; a stale one makes every @{LLM_DIR} rule
+# silently deny instead of match, which looks like a pile of unrelated bugs.
+install_tunable() {
+	printf '@{LLM_DIR} = %s\n' "$ROOT" | sudo tee "$TUNABLE" > /dev/null
+}
+
 # The label the kernel gives a process entered into the profile, with its mode:
 # "llm-server (enforce)". Empty when the profile is not loaded. Unlike
 # /sys/kernel/security/apparmor/profiles, this does not need root to read.
@@ -119,19 +128,26 @@ if [ ! -e "$AA_FEATURES/network_v9/af_inet" ]; then
 	note "warning: this kernel cannot restrict sockets by address, so the $AA allows any TCP peer, not only loopback"
 fi
 
-# The profile hardcodes the checkout path. A mismatch makes every file rule
-# silently deny instead of match, which looks like a pile of unrelated bugs.
-profile_dir=$(sed -n 's/^@{LLM_DIR}[[:space:]]*=[[:space:]]*//p' "$SRC")
-if [ "$profile_dir" != "$ROOT" ]; then
-	confirm "$SRC sets @{LLM_DIR} to '$profile_dir' but this checkout is at '$ROOT'. Update it?" \
-		|| die "declined; fix the @{LLM_DIR} line in $SRC"
-	sed -i "s|^@{LLM_DIR}[[:space:]]*=.*|@{LLM_DIR} = $ROOT|" "$SRC" || die "could not edit $SRC"
+# --- tunable names this checkout --------------------------------------------
+# The path is baked into the loaded profile, so a changed tunable also means
+# a reload, even when the profile file itself is current.
+reason=""
+tunable_dir=$(sed -n 's/^@{LLM_DIR}[[:space:]]*=[[:space:]]*//p' "$TUNABLE" 2> /dev/null)
+if [ "$tunable_dir" != "$ROOT" ]; then
+	if [ -z "$tunable_dir" ]; then
+		confirm "the $AA needs $TUNABLE to name this checkout ($ROOT). Create it (needs sudo)?" \
+			|| die "declined; nothing to run under"
+	else
+		confirm "$TUNABLE names '$tunable_dir' but this checkout is at '$ROOT'. Update it (needs sudo)?" \
+			|| die "declined; nothing to run under"
+	fi
+	install_tunable || die "could not write $TUNABLE"
+	reason="the $AA was loaded for a different checkout path"
 fi
 
 # --- profile installed and current -----------------------------------------
 # The installed file is a copy, so a difference from $SRC means an edit that
 # has not been installed and loaded yet.
-reason=""
 if [ ! -e "$INSTALLED" ]; then
 	# Every line is new on a first install, so show the whole file.
 	diff -u /dev/null "$SRC" >&2

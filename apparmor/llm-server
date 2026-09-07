@@ -25,7 +25,9 @@ abi <abi/4.0>,
 
 include <tunables/global>
 
-@{LLM_DIR} = /home/light/Servers/llm-server
+# Defines @{LLM_DIR}, the absolute path of this checkout. run.sh writes the
+# file on first run and rewrites it if the checkout moves.
+include <tunables/llm-server>
 
 # server.py profile.
 profile llm-server flags=(attach_disconnected) {
