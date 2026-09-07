@@ -24,6 +24,12 @@ KERNEL_PROFILES=/sys/kernel/security/apparmor/profiles
 export TMPDIR="$ROOT/tmp"
 mkdir -p "$TMPDIR" || exit 1
 
+# The profile grants no write access to the code it runs, and that includes
+# __pycache__: a process that can rewrite .pyc files on its import path can
+# make itself come back after a restart. Compiling backends/ in memory on each
+# start costs a few milliseconds.
+export PYTHONDONTWRITEBYTECODE=1
+
 die()  { printf 'run.sh: %s\n' "$*" >&2; exit 1; }
 note() { printf 'run.sh: %s\n' "$*" >&2; }
 

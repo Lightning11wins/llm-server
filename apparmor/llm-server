@@ -46,7 +46,10 @@ profile llm-server flags=(attach_disconnected) {
 	@{LLM_DIR}/backends/{,**} r,
 	@{LLM_DIR}/models/{,**}   r,
 	@{LLM_DIR}/logs/{,**}     rw,
-	@{LLM_DIR}/**/__pycache__/{,**} rw,
+
+	# No write access to __pycache__ anywhere on the import path: a .pyc the
+	# process could rewrite is code that runs at the next start. run.sh and
+	# scripts/e2e.sh set PYTHONDONTWRITEBYTECODE so Python does not try.
 
 	# A writable temp dir is not optional: torch resolves an inductor cache
 	# path when server.py is imported (torch/_dynamo/package.py calls
