@@ -1,4 +1,6 @@
 venv/
+tmp/
+.apparmor-loaded
 __pycache__/
 *.pyc
 logs/*

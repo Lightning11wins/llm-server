@@ -104,11 +104,15 @@ The directory must be a standard HuggingFace model directory: `config.json`, tok
 
 ## Start
 
-```bash
-python3 server.py
-```
+To start, simply run `./run.sh` in the project directory. This sets up the AppArmor profile and Python environment automatically, asking before anything that needs `sudo` or downloads packages.
 
-Default port: `8080`. Change `PORT` at the top of `server.py`. Logs are written to `logs/<timestamp>.log`.
+Binds `127.0.0.1:8080`. Change `HOST` and `PORT` at the top of `server.py`; `HOST = "0.0.0.0"` is there commented out for serving other machines, which also needs a one-line profile change. Logs are written to `logs/<timestamp>.log`.
+
+## AppArmor
+
+`run.sh` confines the server with the AppArmor profile in `apparmor/llm-server`, and the `llama-server` subprocess with a tighter one: read-only on `models/`, loopback only, no write access to the project tree. It installs and reloads the profile as needed, asking first, since that part needs `sudo`.
+
+`./run.sh --unconfined` skips all of it. To remove the profile: `sudo apparmor_parser -R /etc/apparmor.d/llm-server && sudo rm /etc/apparmor.d/llm-server`.
 
 ## API
 
