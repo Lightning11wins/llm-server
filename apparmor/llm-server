@@ -14,6 +14,9 @@
 #   2. The inlined CUDA rules, in place of abstractions/opencl-nvidia. A driver
 #      update could want more.
 #   3. The @{etc_ro} name-resolution files, in place of abstractions/nameservice.
+#   4. The GPU rules cover the CUDA build of llama.cpp only. The Vulkan build
+#      from the README also wants the ICD files under /usr/share/vulkan and
+#      /etc/vulkan, plus /dev/dri; run_tests.sh will list what is missing.
 #
 # Widen the rule here and reload, or walk the denials with `sudo aa-logprof`.
 
@@ -36,8 +39,6 @@ profile llm-server flags=(attach_disconnected) {
 
 	@{LLM_DIR}/venv/{,**}       r,
 	@{LLM_DIR}/venv/**.so*      mr,
-	@{LLM_DIR}/.venv/{,**}      r,
-	@{LLM_DIR}/.venv/**.so*     mr,
 
 	# --- project files -----------------------------------------------------
 	# Only what the server opens; notably not .git, .idea or the root dotfiles.
