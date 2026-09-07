@@ -104,11 +104,17 @@ The directory must be a standard HuggingFace model directory: `config.json`, tok
 
 ## Start
 
-```bash
-python3 server.py
-```
+To start, simply run `./run.sh` in the project directory. This sets up the AppArmor profile and Python environment automatically, asking before anything that needs `sudo` or downloads packages.
 
-Default port: `8080`. Change `PORT` at the top of `server.py`. Logs are written to `logs/<timestamp>.log`.
+Binds `127.0.0.1:8080`. Change `HOST` and `PORT` at the top of `server.py`; `HOST = "0.0.0.0"` is there commented out for serving other machines, which also needs a one-line profile change. Logs are written to `logs/<timestamp>.log`.
+
+## AppArmor
+
+`run.sh` confines the server with the AppArmor profile in `apparmor/llm-server`, and the `llama-server` subprocess with a tighter one: read-only on `models/`, TCP only, and the only thing it can write is its own log. The server itself can write `logs/` and `tmp/`, nothing else in the project. `run.sh` copies the profile to `/etc/apparmor.d` and reloads it whenever the two differ, asking first, since that part needs `sudo`.
+
+The profile also pins both processes to loopback addresses, but only on a kernel that mediates socket addresses (`/sys/kernel/security/apparmor/features/network_v9/af_inet` exists). On other kernels the rules load as plain TCP permission and `run.sh` prints a warning.
+
+`./run.sh --unconfined` skips all of it. To remove the profile: `sudo apparmor_parser -R /etc/apparmor.d/llm-server && sudo rm /etc/apparmor.d/llm-server`.
 
 ## API
 
@@ -192,9 +198,11 @@ On mid-stream error: `data: {"error": "..."}` then stream closes.
 ## Testing
 
 ```bash
-scripts/e2e.sh                # start a server on port 8098, load/run/evict every model, stop
-scripts/e2e.sh qwen3.5-9b     # just the named models
+./run-tests.sh                # load, run, evict and unload every model in models/
+./run-tests.sh qwen3.5-9b     # just the named models
 ```
+
+When the AppArmor profile is loaded, this offers to reload it in complain mode for the run (needs `sudo`), so a rule that is too tight is reported at the end rather than breaking a test in the middle, and puts it back in enforce mode afterwards. Any reported denial fails the run. Complain mode applies to every process under the profile, so the script refuses to start while a `./run.sh` server is running.
 
 ## TODO
 
