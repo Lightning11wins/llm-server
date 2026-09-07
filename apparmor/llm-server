@@ -12,7 +12,8 @@
 #   1. No /dev/shm and no writable temp dir in the child profile. First things
 #      to add back if a GGUF stops loading; reason will be in logs/llama-*.log.
 #   2. The inlined CUDA rules, in place of abstractions/opencl-nvidia. A driver
-#      update could want more.
+#      or toolkit update could want more; the toolkit libraries llama-server
+#      links are matched by version glob.
 #   3. The @{etc_ro} name-resolution files, in place of abstractions/nameservice.
 #   4. The GPU rules cover the CUDA build of llama.cpp only. The Vulkan build
 #      from the README also wants the ICD files under /usr/share/vulkan and
@@ -37,6 +38,13 @@ profile llm-server flags=(attach_disconnected) {
 	# configurations, and inheriting this profile means they cannot escape it.
 	/usr/bin/python3.[0-9]*     ix,
 
+	# Importing torch probes for a C compiler (inductor) and runs `ldconfig -p`
+	# (triton). Neither is needed to serve, and both fail gracefully, but a
+	# plain denial is logged and would fail every ./run_tests.sh run. Explicit
+	# deny rules are silent.
+	deny /usr/sbin/ldconfig{,.real}   x,
+	deny /usr/bin/x86_64-linux-gnu-*  x,
+
 	@{LLM_DIR}/venv/{,**}       r,
 	@{LLM_DIR}/venv/**.so*      mr,
 
@@ -51,6 +59,8 @@ profile llm-server flags=(attach_disconnected) {
 	# No write access to __pycache__ anywhere on the import path: a .pyc the
 	# process could rewrite is code that runs at the next start. run.sh and
 	# scripts/e2e.sh set PYTHONDONTWRITEBYTECODE so Python does not try.
+	# Reading one left over from an unconfined run is fine.
+	@{LLM_DIR}/__pycache__/{,*.pyc} r,
 
 	# A writable temp dir is not optional: torch resolves an inductor cache
 	# path when server.py is imported (torch/_dynamo/package.py calls
@@ -115,7 +125,11 @@ profile llm-server flags=(attach_disconnected) {
 	# parent uses waitpid, never reads the child's /proc entries.
 	signal (send) set=(term, kill) peer=llm-server//llama_server,
 
-	@{LLM_DIR}/bin/llama.cpp/llama-server Px -> llm-server//llama_server,
+	# Lower-case `px`, not `Px`: the upper-case form is a secure exec, and the
+	# kernel clears PR_SET_PDEATHSIG on those, which is what makes llama-server
+	# die with the server (backends/llama_cpp.py). The environment is not
+	# scrubbed as a result, but the child is confined either way.
+	@{LLM_DIR}/bin/llama.cpp/llama-server px -> llm-server//llama_server,
 
 	profile llama_server {
 		include <abstractions/base>
@@ -123,6 +137,11 @@ profile llm-server flags=(attach_disconnected) {
 		@{LLM_DIR}/bin/llama.cpp/llama-server  mr,
 		@{LLM_DIR}/bin/llama.cpp/*.so*         mr,
 		@{LLM_DIR}/models/{,**}                r,
+
+		# The CUDA build links the toolkit's runtime and cuBLAS through its
+		# RUNPATH (/usr/local/cuda/lib64), which abstractions/base does not
+		# cover. Not needed by the parent: torch ships its own copies in venv.
+		/usr/local/cuda-*/targets/*/lib/*.so*  mr,
 
 		# Its log, opened by the parent and inherited. AppArmor revalidates
 		# inherited fds at exec, so the rule is needed despite no open() here.
