@@ -1,0 +1,146 @@
+# AppArmor profile for llm-server and its llama.cpp subprocess. Entered
+# explicitly by run.sh, via `aa-exec -p llm-server`.
+#
+# It is a named profile rather than one attached to an executable path because
+# the venv's python3 is a symlink to /usr/bin/python3, and attaching there
+# would confine every Python process on the machine.
+#
+# The rules are tighter than aa-genprof would produce, so ./run_tests.sh
+# exercises them in complain mode and reports what it would have blocked. If
+# something breaks, the likeliest causes, in order:
+#
+#   1. No /dev/shm and no writable temp dir in the child profile. First things
+#      to add back if a GGUF stops loading; reason will be in logs/llama-*.log.
+#   2. The inlined CUDA rules, in place of abstractions/opencl-nvidia. A driver
+#      update could want more.
+#   3. The @{etc_ro} name-resolution files, in place of abstractions/nameservice.
+#
+# Widen the rule here and reload, or walk the denials with `sudo aa-logprof`.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+@{LLM_DIR} = /home/light/Servers/llm-server
+
+# server.py profile.
+profile llm-server flags=(attach_disconnected) {
+	include <abstractions/base>
+	include <abstractions/openssl>
+	include <abstractions/python>
+
+	# --- interpreter -------------------------------------------------------
+	# `ix`, not `r`: torch and accelerate re-exec sys.executable in some
+	# configurations, and inheriting this profile means they cannot escape it.
+	/usr/bin/python3.[0-9]*     ix,
+
+	@{LLM_DIR}/venv/{,**}       r,
+	@{LLM_DIR}/venv/**.so*      mr,
+	@{LLM_DIR}/.venv/{,**}      r,
+	@{LLM_DIR}/.venv/**.so*     mr,
+
+	# --- project files -----------------------------------------------------
+	# Only what the server opens; notably not .git, .idea or the root dotfiles.
+	@{LLM_DIR}/               r,
+	@{LLM_DIR}/server.py      r,
+	@{LLM_DIR}/backends/{,**} r,
+	@{LLM_DIR}/models/{,**}   r,
+	@{LLM_DIR}/logs/{,**}     rw,
+	@{LLM_DIR}/**/__pycache__/{,**} rw,
+
+	# A writable temp dir is not optional: torch resolves an inductor cache
+	# path when server.py is imported (torch/_dynamo/package.py calls
+	# tempfile.gettempdir()), and with nothing writable the import dies. run.sh
+	# and scripts/e2e.sh point TMPDIR here, keeping /tmp out of the profile.
+	owner @{LLM_DIR}/tmp/     rw,
+	owner @{LLM_DIR}/tmp/**   rwk,
+	owner @{LLM_DIR}/tmp/**/  rw,
+
+	# --- name resolution ---------------------------------------------------
+	# Not abstractions/nameservice, which pulls in NIS, LDAP, winbind, Kerberos,
+	# mDNS and the nscd/avahi sockets. This is enough for getaddrinfo on a
+	# literal address, which is all either process asks for.
+	@{etc_ro}/nsswitch.conf   r,
+	@{etc_ro}/host.conf       r,
+	@{etc_ro}/hosts           r,
+	@{etc_ro}/gai.conf        r,
+	@{etc_ro}/services        r,
+	@{etc_ro}/passwd          r,
+	@{etc_ro}/group           r,
+	/{usr/,}lib/@{multiarch}/libnss_*.so* mr,
+
+	# --- network -----------------------------------------------------------
+	# `ip=` pins the socket's local endpoint, so a connect() off-box (whose
+	# local endpoint would be an interface address) is refused. Dormant unless
+	# the kernel exports .../apparmor/features/network_v9/af_inet; without it
+	# the parser downgrades these to plain `network inet stream` at load.
+	network inet  stream ip=127.0.0.1,
+	network inet  stream peer=(ip=127.0.0.1),
+
+	# urllib3 tests for working IPv6 at import time by binding ::1 and never
+	# connecting (HAS_IPV6 = _has_ipv6("::1")). Nothing else needs inet6.
+	network inet6 stream ip=::1,
+
+	# Swap for these three if server.py sets HOST = "0.0.0.0".
+	# network inet stream,
+	# network inet6 stream,
+
+	# --- runtime introspection --------------------------------------------
+	owner @{PROC}/@{pid}/{,**}  r,
+	@{PROC}/sys/kernel/osrelease r,
+	@{PROC}/{stat,meminfo,cpuinfo} r,
+	@{sys}/devices/system/cpu/{,**} r,
+	@{sys}/devices/system/node/{,**} r,
+
+	# --- GPU ---------------------------------------------------------------
+	# The transformers backend loads weights in-process, so CUDA runs here.
+	# abstractions/opencl-nvidia covers this but also grants a Px transition
+	# into the setuid nvidia-modprobe, so the four rules CUDA needs are inlined.
+	include <abstractions/nvidia>
+	/dev/nvidia-uvm             rw,
+	@{PROC}/devices             r,
+	@{PROC}/sys/vm/mmap_min_addr r,
+	@{sys}/devices/@{pci_bus}/**/config r,
+
+	# torch allocates shared tensors here.
+	/dev/shm/                   r,
+	owner /dev/shm/**           rw,
+
+	# --- subprocess management --------------------------------------------
+	# terminate() then kill() in LlamaCppBackend.unload(). No ptrace rule: the
+	# parent uses waitpid, never reads the child's /proc entries.
+	signal (send) set=(term, kill) peer=llm-server//llama_server,
+
+	@{LLM_DIR}/bin/llama.cpp/llama-server Px -> llm-server//llama_server,
+
+	profile llama_server {
+		include <abstractions/base>
+
+		@{LLM_DIR}/bin/llama.cpp/llama-server  mr,
+		@{LLM_DIR}/bin/llama.cpp/*.so*         mr,
+		@{LLM_DIR}/models/{,**}                r,
+
+		# Its log, opened by the parent and inherited. AppArmor revalidates
+		# inherited fds at exec, so the rule is needed despite no open() here.
+		@{LLM_DIR}/logs/llama-*.log w,
+
+		# Loopback only, same caveat as the parent's rules. No inet6: traced
+		# with `strace -f -e trace=socket`, llama-server creates exactly one
+		# socket, AF_INET, since --host 127.0.0.1 is a literal IPv4 address.
+		network inet stream ip=127.0.0.1,
+		network inet stream peer=(ip=127.0.0.1),
+
+		owner @{PROC}/@{pid}/{,**}  r,
+		@{PROC}/{stat,meminfo,cpuinfo} r,
+		@{sys}/devices/system/cpu/{,**} r,
+		@{sys}/devices/system/node/{,**} r,
+
+		include <abstractions/nvidia>
+		/dev/nvidia-uvm             rw,
+		@{PROC}/devices             r,
+		@{PROC}/sys/vm/mmap_min_addr r,
+		@{sys}/devices/@{pci_bus}/**/config r,
+
+		signal (receive) peer=llm-server,
+	}
+}
