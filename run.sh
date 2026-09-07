@@ -16,6 +16,7 @@ AA="AppArmor profile '$PROFILE'"
 SRC=apparmor/$PROFILE
 INSTALLED=/etc/apparmor.d/$PROFILE
 PYTHON=venv/bin/python
+AA_FEATURES=/sys/kernel/security/apparmor/features
 KERNEL_PROFILES=/sys/kernel/security/apparmor/profiles
 
 # torch resolves a cache directory from tempfile.gettempdir() when server.py is
@@ -81,6 +82,13 @@ fi
 command -v aa-exec > /dev/null || die "aa-exec not found. Install the apparmor package, or run ./run.sh --unconfined"
 [ "$(aa-enabled 2> /dev/null)" = "Yes" ] || die "AppArmor is not enabled on this kernel (aa-enabled: $(aa-enabled 2>&1)). Run ./run.sh --unconfined to start without it"
 [ -e "$SRC" ] || die "$SRC is missing from this checkout"
+
+# The profile's ip= and peer= network rules need the kernel to mediate inet
+# addresses. Without that the parser loads them as plain `network inet
+# stream`, and the profile no longer keeps the server on loopback.
+if [ ! -e "$AA_FEATURES/network_v9/af_inet" ]; then
+	note "warning: this kernel cannot restrict sockets by address, so the $AA allows any TCP peer, not only loopback"
+fi
 
 # The profile hardcodes the checkout path. A mismatch makes every file rule
 # silently deny instead of match, which looks like a pile of unrelated bugs.
