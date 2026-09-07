@@ -71,3 +71,4 @@ pgrep -af llama-server | grep -v pgrep || echo "(none)"
 
 echo
 [ $fail -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
+exit $fail
