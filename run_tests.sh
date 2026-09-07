@@ -45,8 +45,11 @@ if ! aa-exec -p "$PROFILE" -- true 2> /dev/null; then
 	note "the $AA is not loaded, so the tests run unconfined (see ./run.sh)"
 elif [ ! -e "$INSTALLED" ]; then
 	note "the $AA is loaded but $INSTALLED is missing; running with it as-is, so a too-tight rule will look like a test failure"
+elif ! cmp -s apparmor/$PROFILE "$INSTALLED"; then
+	note "apparmor/$PROFILE differs from $INSTALLED; the tests would run against the installed copy. Run ./run.sh once to install and load it, then rerun"
+	exit 1
 elif confirm "run with the $AA in complain mode, so denied accesses are reported rather than blocked (needs sudo)?"; then
-	if sudo apparmor_parser -r -C "$INSTALLED" > /dev/null; then
+	if sudo apparmor_parser -r -C --skip-cache "$INSTALLED" > /dev/null; then
 		complaining=1
 		trap restore_enforce EXIT
 	else
