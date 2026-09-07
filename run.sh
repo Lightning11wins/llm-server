@@ -24,6 +24,10 @@ AA_FEATURES=/sys/kernel/security/apparmor/features
 export TMPDIR="$ROOT/tmp"
 mkdir -p "$TMPDIR" || exit 1
 
+# CUDA's PTX JIT cache defaults to ~/.nv/ComputeCache. The profile grants no
+# writes under $HOME, so keep the cache next to the other temp files.
+export CUDA_CACHE_PATH="$TMPDIR/cuda-cache"
+
 # The profile grants no write access to the code it runs, and that includes
 # __pycache__: a process that can rewrite .pyc files on its import path can
 # make itself come back after a restart. Compiling backends/ in memory on each
