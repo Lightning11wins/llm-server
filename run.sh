@@ -65,10 +65,13 @@ install_profile() {
 	staged=$(dirname "$INSTALLED")/.$PROFILE.new
 	apparmor_parser -Q --skip-cache "$SRC" || return 1
 	sudo install -m 0644 -o root -g root "$SRC" "$staged" || return 1
-	if sudo apparmor_parser -r --skip-cache "$staged"; then
-		sudo mv "$staged" "$INSTALLED"
-	else
+	if ! sudo apparmor_parser -r --skip-cache "$staged"; then
 		sudo rm -f "$staged"
+		return 1
+	fi
+	if ! sudo mv "$staged" "$INSTALLED"; then
+		sudo rm -f "$staged"
+		note "the $AA is loaded, but could not be installed to $INSTALLED; rerun to retry"
 		return 1
 	fi
 }
@@ -130,7 +133,9 @@ fi
 # has not been installed and loaded yet.
 reason=""
 if [ ! -e "$INSTALLED" ]; then
-	reason="the $AA is not installed"
+	# Every line is new on a first install, so show the whole file.
+	diff -u /dev/null "$SRC" >&2
+	reason="the $AA is not installed (contents above)"
 elif [ -L "$INSTALLED" ]; then
 	# Left by an earlier run.sh that symlinked instead of copying.
 	reason="$INSTALLED is a symlink rather than a root-owned copy"
