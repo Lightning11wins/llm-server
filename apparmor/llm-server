@@ -11,9 +11,9 @@
 #
 #   1. No /dev/shm and no writable temp dir in the child profile. First things
 #      to add back if a GGUF stops loading; reason will be in logs/llama-*.log.
-#   2. The inlined CUDA rules, in place of abstractions/opencl-nvidia. A driver
-#      or toolkit update could want more; the toolkit libraries llama-server
-#      links are matched by version glob.
+#   2. The inlined CUDA rules, in place of abstractions/nvidia and
+#      abstractions/opencl-nvidia. A driver or toolkit update could want more;
+#      the toolkit libraries llama-server links are matched by version glob.
 #   3. The @{etc_ro} name-resolution files, in place of abstractions/nameservice.
 #   4. The GPU rules cover the CUDA build of llama.cpp only. The Vulkan build
 #      from the README also wants the ICD files under /usr/share/vulkan and
@@ -108,12 +108,19 @@ profile llm-server flags=(attach_disconnected) {
 
 	# --- GPU ---------------------------------------------------------------
 	# The transformers backend loads weights in-process, so CUDA runs here.
-	# abstractions/opencl-nvidia covers this but also grants a Px transition
-	# into the setuid nvidia-modprobe, so the four rules CUDA needs are inlined.
-	include <abstractions/nvidia>
+	# Not abstractions/nvidia, which also grants capability ipc_lock, a
+	# writable GL shader cache under $HOME and the X driver's unix sockets;
+	# nor abstractions/opencl-nvidia, which adds a Px transition into the
+	# setuid nvidia-modprobe. What CUDA itself touches is inlined instead.
+	/dev/nvidiactl              rw,
+	/dev/nvidia[0-9]*           rw,
 	/dev/nvidia-uvm             rw,
 	@{PROC}/devices             r,
+	@{PROC}/modules             r,
+	@{PROC}/driver/nvidia/params r,
 	@{PROC}/sys/vm/mmap_min_addr r,
+	@{PROC}/sys/vm/max_map_count r,
+	@{sys}/devices/system/memory/block_size_bytes r,
 	@{sys}/devices/@{pci_bus}/**/config r,
 
 	# torch allocates shared tensors here.
@@ -158,10 +165,16 @@ profile llm-server flags=(attach_disconnected) {
 		@{sys}/devices/system/cpu/{,**} r,
 		@{sys}/devices/system/node/{,**} r,
 
-		include <abstractions/nvidia>
+		# Same CUDA rules as the parent, for the same reasons.
+		/dev/nvidiactl              rw,
+		/dev/nvidia[0-9]*           rw,
 		/dev/nvidia-uvm             rw,
 		@{PROC}/devices             r,
+		@{PROC}/modules             r,
+		@{PROC}/driver/nvidia/params r,
 		@{PROC}/sys/vm/mmap_min_addr r,
+		@{PROC}/sys/vm/max_map_count r,
+		@{sys}/devices/system/memory/block_size_bytes r,
 		@{sys}/devices/@{pci_bus}/**/config r,
 
 		signal (receive) peer=llm-server,
