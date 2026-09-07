@@ -117,6 +117,9 @@ fi
 reason=""
 if [ ! -e "$INSTALLED" ]; then
 	reason="the $AA is not installed"
+elif [ -L "$INSTALLED" ]; then
+	# Left by an earlier run.sh that symlinked instead of copying.
+	reason="$INSTALLED is a symlink rather than a root-owned copy"
 elif ! cmp -s "$SRC" "$INSTALLED"; then
 	reason="$INSTALLED does not match $SRC"
 fi
