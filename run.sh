@@ -17,7 +17,6 @@ SRC=apparmor/$PROFILE
 INSTALLED=/etc/apparmor.d/$PROFILE
 PYTHON=venv/bin/python
 AA_FEATURES=/sys/kernel/security/apparmor/features
-KERNEL_PROFILES=/sys/kernel/security/apparmor/profiles
 
 # torch resolves a cache directory from tempfile.gettempdir() when server.py is
 # imported, so the profile has to grant a writable temp dir. Keeping it in the
@@ -49,9 +48,22 @@ confirm() {
 # A root-owned copy, not a symlink into this checkout. apparmor.service loads
 # everything under /etc/apparmor.d at boot, and a symlink there would let
 # anyone who can write to this directory author system-wide policy as root.
+#
+# Loaded before it is copied: a profile the parser rejects must not end up in
+# /etc/apparmor.d, where it would match $SRC and hide that the kernel still has
+# the previous version. The unprivileged -Q dry run catches most of that
+# before sudo is even asked for.
 install_profile() {
-	sudo install -m 0644 -o root -g root "$SRC" "$INSTALLED" \
-		&& sudo apparmor_parser -r "$INSTALLED"
+	apparmor_parser -Q --skip-cache "$SRC" || return 1
+	sudo apparmor_parser -r --skip-cache "$SRC" \
+		&& sudo install -m 0644 -o root -g root "$SRC" "$INSTALLED"
+}
+
+# The label the kernel gives a process entered into the profile, with its mode:
+# "llm-server (enforce)". Empty when the profile is not loaded. Unlike
+# /sys/kernel/security/apparmor/profiles, this does not need root to read.
+loaded_label() {
+	aa-exec -p "$PROFILE" -- cat /proc/self/attr/current 2> /dev/null
 }
 
 # Create the venv and install requirements if they are not there yet. torch is
@@ -114,23 +126,28 @@ if [ -n "$reason" ]; then
 	install_profile || die "could not load the profile"
 fi
 
-# --- profile loaded into the kernel ----------------------------------------
-# Reading the kernel's profile list needs root, so when it is unreadable, fall
-# back to entering the profile and seeing whether Python starts.
-if loaded=$(cat "$KERNEL_PROFILES" 2> /dev/null); then
-	mode=$(awk -v p="$PROFILE" '$1 == p { print $2; exit }' <<< "$loaded")
-	if [ -z "$mode" ]; then
+# --- profile loaded into the kernel, in enforce mode -----------------------
+case "$(loaded_label)" in
+	"$PROFILE (enforce)")
+		;;
+	"")
 		confirm "the $AA is installed but not loaded into the kernel. Load it (needs sudo)?" \
 			|| die "declined; nothing to run under"
 		install_profile || die "load failed"
-	elif [ "$mode" != "(enforce)" ]; then
-		note "warning: the $AA is loaded in $mode mode, so violations are logged but not blocked"
-	fi
-elif ! aa-exec -p "$PROFILE" -- "$PYTHON" -c pass 2> /dev/null; then
-	die "could not start python under the $AA. Either it is not loaded:
-    sudo apparmor_parser -r '$INSTALLED'
-or it is denying something needed at startup:
+		;;
+	*)
+		# Complain mode is what run_tests.sh leaves behind when it could not
+		# restore enforce mode on its way out.
+		confirm "the $AA is loaded in complain mode, so violations would be logged but not blocked. Reload it in enforce mode (needs sudo)?" \
+			|| die "declined; nothing to run under"
+		install_profile || die "reload failed"
+		;;
+esac
+
+# The profile denying something Python needs at startup would show up here as
+# an unexplained exit, so name the log to look in.
+aa-exec -p "$PROFILE" -- "$PYTHON" -c pass 2> /dev/null \
+	|| die "could not start python under the $AA; it is denying something needed at startup:
     sudo journalctl -k --since '1 min ago' | grep apparmor"
-fi
 
 exec aa-exec -p "$PROFILE" -- "$PYTHON" server.py
