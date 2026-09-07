@@ -115,13 +115,20 @@ profile llm-server flags=(attach_disconnected) {
 	/dev/nvidiactl              rw,
 	/dev/nvidia[0-9]*           rw,
 	/dev/nvidia-uvm             rw,
+	/dev/nvidia-uvm-tools       rw,
 	@{PROC}/devices             r,
 	@{PROC}/modules             r,
 	@{PROC}/driver/nvidia/params r,
+	@{PROC}/driver/nvidia/gpus/*/{information,numa_status} r,
 	@{PROC}/sys/vm/mmap_min_addr r,
 	@{PROC}/sys/vm/max_map_count r,
 	@{sys}/devices/system/memory/block_size_bytes r,
-	@{sys}/devices/@{pci_bus}/**/config r,
+	@{sys}/devices/@{pci_bus}/**/{config,numa_node} r,
+	/usr/share/nvidia/nvidia-application-profiles* r,
+	owner @{HOME}/.nv/nvidia-application-profiles-rc{,.d/,.d/*} r,
+	# The PTX JIT cache: CUDA_CACHE_PATH in run.sh and scripts/e2e.sh points it
+	# here instead of the default ~/.nv/ComputeCache, keeping $HOME read-only.
+	owner @{LLM_DIR}/tmp/cuda-cache/{,**} rwk,
 
 	# torch allocates shared tensors here.
 	/dev/shm/                   r,
@@ -169,13 +176,18 @@ profile llm-server flags=(attach_disconnected) {
 		/dev/nvidiactl              rw,
 		/dev/nvidia[0-9]*           rw,
 		/dev/nvidia-uvm             rw,
+		/dev/nvidia-uvm-tools       rw,
 		@{PROC}/devices             r,
 		@{PROC}/modules             r,
 		@{PROC}/driver/nvidia/params r,
+		@{PROC}/driver/nvidia/gpus/*/{information,numa_status} r,
 		@{PROC}/sys/vm/mmap_min_addr r,
 		@{PROC}/sys/vm/max_map_count r,
 		@{sys}/devices/system/memory/block_size_bytes r,
-		@{sys}/devices/@{pci_bus}/**/config r,
+		@{sys}/devices/@{pci_bus}/**/{config,numa_node} r,
+		/usr/share/nvidia/nvidia-application-profiles* r,
+		owner @{HOME}/.nv/nvidia-application-profiles-rc{,.d/,.d/*} r,
+		owner @{LLM_DIR}/tmp/cuda-cache/{,**} rwk,
 
 		signal (receive) peer=llm-server,
 	}

@@ -10,8 +10,9 @@ cd "$(dirname "$0")/.."
 # AppArmor revalidates against the profile at exec.
 export TMPDIR="$PWD/tmp"
 mkdir -p "$TMPDIR" || exit 1
-# The profile grants no write access to __pycache__; see run.sh.
+# The profile grants no write access to __pycache__ or $HOME; see run.sh.
 export PYTHONDONTWRITEBYTECODE=1
+export CUDA_CACHE_PATH="$TMPDIR/cuda-cache"
 
 PORT=8098
 TTL=2  # eviction monitor polls every 5s, so waits below are TTL + 6
