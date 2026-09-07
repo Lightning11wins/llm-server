@@ -48,6 +48,11 @@ elif [ ! -e "$INSTALLED" ]; then
 elif ! cmp -s apparmor/$PROFILE "$INSTALLED"; then
 	note "apparmor/$PROFILE differs from $INSTALLED; the tests would run against the installed copy. Run ./run.sh once to install and load it, then rerun"
 	exit 1
+elif grep -lqs "^$PROFILE[ /]" /proc/[0-9]*/attr/current; then
+	# Complain mode is a property of the profile, not of this run, so it would
+	# also lift confinement from a server already running under it.
+	note "a process is already running under the $AA (a ./run.sh server?). Stop it first: complain mode would apply to it too"
+	exit 1
 elif confirm "run with the $AA in complain mode, so denied accesses are reported rather than blocked (needs sudo)?"; then
 	if sudo apparmor_parser -r -C --skip-cache "$INSTALLED" > /dev/null; then
 		complaining=1
@@ -68,22 +73,29 @@ rc=$?
 if [ $complaining -eq 1 ]; then
 	echo
 	echo "--- AppArmor accesses denied during the run:"
-	if pgrep -x auditd > /dev/null; then
-		echo "  (auditd is running, so denials went to /var/log/audit/audit.log rather than the kernel log read here)"
-	fi
 	# ALLOWED lines are what complain mode logs in place of a denial. Keep the
 	# fields that say what was asked for: profile, operation, path or socket
-	# family, and the permission mask.
-	denied=$(sudo journalctl -k --since "$started" 2> /dev/null \
+	# family, capability, signal, peer, and the permission mask. sudo -v first,
+	# so an expired sudo ticket prompts here rather than inside the pipeline,
+	# and a journal that could not be read is a failure, not a clean report.
+	sudo -v
+	denied=$(sudo journalctl -k --since "$started" \
 		| awk -v p="$PROFILE" '
 			index($0, "apparmor=\"ALLOWED\"") && index($0, "profile=\"" p) {
 				out = ""
 				for (i = 1; i <= NF; i++)
-					if ($i ~ /^(profile|operation|name|family|requested_mask)=/) out = out " " $i
+					if ($i ~ /^(profile|operation|name|family|sock_type|capname|signal|peer|requested_mask)=/) out = out " " $i
 				print out
 			}' \
 		| sort -u)
-	if [ -n "$denied" ]; then
+	journal_rc=$?  # pipefail: non-zero if journalctl failed
+	if [ "$journal_rc" -ne 0 ]; then
+		echo "  could not read the kernel log (journalctl exited $journal_rc), so denials could not be checked"
+		rc=1
+	elif pgrep -x auditd > /dev/null; then
+		echo "  auditd is running, so denials went to /var/log/audit/audit.log rather than the kernel log; check it with: sudo ausearch -m AVC -ts recent"
+		rc=1
+	elif [ -n "$denied" ]; then
 		echo "$denied"
 		echo
 		echo "Each line is an access the profile does not grant. Widen the rule in"
