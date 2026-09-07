@@ -202,7 +202,7 @@ On mid-stream error: `data: {"error": "..."}` then stream closes.
 ./run_tests.sh qwen3.5-9b     # just the named models
 ```
 
-Runs against the AppArmor profile in complain mode when it is installed, so a rule that is too tight is reported at the end rather than breaking a test in the middle.
+When the AppArmor profile is loaded, this offers to reload it in complain mode for the run (needs `sudo`), so a rule that is too tight is reported at the end rather than breaking a test in the middle, and puts it back in enforce mode afterwards. Any reported denial fails the run.
 
 ## TODO
 
