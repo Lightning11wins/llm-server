@@ -161,7 +161,7 @@ case "$(loaded_label)" in
 		install_profile || die "load failed"
 		;;
 	*)
-		# Complain mode is what run_tests.sh leaves behind when it could not
+		# Complain mode is what run-tests.sh leaves behind when it could not
 		# restore enforce mode on its way out.
 		confirm "the $AA is loaded in complain mode, so violations would be logged but not blocked. Reload it in enforce mode (needs sudo)?" \
 			|| die "declined; nothing to run under"
