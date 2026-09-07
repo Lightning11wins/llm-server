@@ -21,11 +21,15 @@ if [ ${#MODELS[@]} -eq 0 ]; then
 	MODELS=($(ls -d models/*/ | xargs -n1 basename))
 fi
 
-# Run the server under the AppArmor profile when it is installed, so the tests
-# exercise the same confinement as run.sh.
+# Run the server under the AppArmor profile when it is loaded, so the tests
+# exercise the same confinement as run.sh. Checked by entering the profile,
+# not by looking in /etc/apparmor.d: an installed but unloaded profile would
+# make aa-exec fail and the server never start.
 CONFINE=""
-if [ -e /etc/apparmor.d/llm-server ] && command -v aa-exec > /dev/null; then
+if aa-exec -p llm-server -- true 2> /dev/null; then
 	CONFINE="aa-exec -p llm-server --"
+else
+	echo "note: the llm-server AppArmor profile is not loaded; running unconfined" >&2
 fi
 
 $CONFINE venv/bin/python -c "import server, uvicorn; uvicorn.run(server.app, host='127.0.0.1', port=$PORT)" > "$LOG" 2>&1 &

@@ -38,7 +38,7 @@ note() { printf 'run.sh: %s\n' "$*" >&2; }
 # from, is a failure rather than a silent fall back to running unconfined.
 confirm() {
 	local answer
-	if [ ! -t 1 ]; then
+	if ! { : < /dev/tty; } 2> /dev/null; then
 		note "$* (no terminal to ask on)"
 		return 1
 	fi
