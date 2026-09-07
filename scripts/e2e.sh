@@ -5,6 +5,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Keep temp files inside the project: torch needs a writable temp dir when
+# server.py is imported, and the server inherits the fd for $LOG below, which
+# AppArmor revalidates against the profile at exec.
+export TMPDIR="$PWD/tmp"
+mkdir -p "$TMPDIR" || exit 1
+
 PORT=8098
 TTL=2  # eviction monitor polls every 5s, so waits below are TTL + 6
 LOG="$(mktemp)"
@@ -13,7 +19,14 @@ if [ ${#MODELS[@]} -eq 0 ]; then
 	MODELS=($(ls -d models/*/ | xargs -n1 basename))
 fi
 
-PORT=$PORT venv/bin/python -c "import server, uvicorn; uvicorn.run(server.app, host='127.0.0.1', port=$PORT)" > "$LOG" 2>&1 &
+# Run the server under the AppArmor profile when it is installed, so the tests
+# exercise the same confinement as run.sh.
+CONFINE=""
+if [ -e /etc/apparmor.d/llm-server ] && command -v aa-exec > /dev/null; then
+	CONFINE="aa-exec -p llm-server --"
+fi
+
+$CONFINE venv/bin/python -c "import server, uvicorn; uvicorn.run(server.app, host='127.0.0.1', port=$PORT)" > "$LOG" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo; echo "--- server log:"; cat "$LOG"; rm -f "$LOG"' EXIT
 

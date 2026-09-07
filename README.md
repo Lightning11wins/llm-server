@@ -196,9 +196,11 @@ On mid-stream error: `data: {"error": "..."}` then stream closes.
 ## Testing
 
 ```bash
-scripts/e2e.sh                # start a server on port 8098, load/run/evict every model, stop
-scripts/e2e.sh qwen3.5-9b     # just the named models
+./run_tests.sh                # load, run, evict and unload every model in models/
+./run_tests.sh qwen3.5-9b     # just the named models
 ```
+
+Runs against the AppArmor profile in complain mode when it is installed, so a rule that is too tight is reported at the end rather than breaking a test in the middle.
 
 ## TODO
 
