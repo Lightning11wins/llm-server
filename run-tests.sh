@@ -5,7 +5,7 @@
 # mode, so a rule that is too tight shows up as a report at the end instead of
 # a confusing failure in the middle. Enforce mode is restored on the way out.
 #
-# Usage: ./run_tests.sh [model ...]      (default: every directory in models/)
+# Usage: ./run-tests.sh [model ...]      (default: every directory in models/)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 1
@@ -15,7 +15,7 @@ PROFILE=llm-server
 AA="AppArmor profile '$PROFILE'"
 INSTALLED=/etc/apparmor.d/$PROFILE
 
-note() { printf 'run_tests.sh: %s\n' "$*" >&2; }
+note() { printf 'run-tests.sh: %s\n' "$*" >&2; }
 
 confirm() {
 	local answer
@@ -23,7 +23,7 @@ confirm() {
 		note "$* (no terminal to ask on)"
 		return 1
 	fi
-	read -r -p "run_tests.sh: $* [y/N] " answer < /dev/tty || return 1
+	read -r -p "run-tests.sh: $* [y/N] " answer < /dev/tty || return 1
 	[[ $answer == [yY]* ]]
 }
 

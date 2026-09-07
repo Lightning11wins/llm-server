@@ -5,7 +5,7 @@
 # the venv's python3 is a symlink to /usr/bin/python3, and attaching there
 # would confine every Python process on the machine.
 #
-# The rules are tighter than aa-genprof would produce, so ./run_tests.sh
+# The rules are tighter than aa-genprof would produce, so ./run-tests.sh
 # exercises them in complain mode and reports what it would have blocked. If
 # something breaks, the likeliest causes, in order:
 #
@@ -17,7 +17,7 @@
 #   3. The @{etc_ro} name-resolution files, in place of abstractions/nameservice.
 #   4. The GPU rules cover the CUDA build of llama.cpp only. The Vulkan build
 #      from the README also wants the ICD files under /usr/share/vulkan and
-#      /etc/vulkan, plus /dev/dri; run_tests.sh will list what is missing.
+#      /etc/vulkan, plus /dev/dri; run-tests.sh will list what is missing.
 #
 # Widen the rule here and reload, or walk the denials with `sudo aa-logprof`.
 
@@ -40,7 +40,7 @@ profile llm-server flags=(attach_disconnected) {
 
 	# Importing torch probes for a C compiler (inductor) and runs `ldconfig -p`
 	# (triton). Neither is needed to serve, and both fail gracefully, but a
-	# plain denial is logged and would fail every ./run_tests.sh run. Explicit
+	# plain denial is logged and would fail every ./run-tests.sh run. Explicit
 	# deny rules are silent.
 	deny /usr/sbin/ldconfig{,.real}   x,
 	deny /usr/bin/x86_64-linux-gnu-*  x,
