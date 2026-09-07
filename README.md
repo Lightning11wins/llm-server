@@ -110,7 +110,9 @@ Binds `127.0.0.1:8080`. Change `HOST` and `PORT` at the top of `server.py`; `HOS
 
 ## AppArmor
 
-`run.sh` confines the server with the AppArmor profile in `apparmor/llm-server`, and the `llama-server` subprocess with a tighter one: read-only on `models/`, loopback only, no write access to the project tree. It installs and reloads the profile as needed, asking first, since that part needs `sudo`.
+`run.sh` confines the server with the AppArmor profile in `apparmor/llm-server`, and the `llama-server` subprocess with a tighter one: read-only on `models/`, TCP only, and the only thing it can write is its own log. The server itself can write `logs/` and `tmp/`, nothing else in the project. `run.sh` copies the profile to `/etc/apparmor.d` and reloads it whenever the two differ, asking first, since that part needs `sudo`.
+
+The profile also pins both processes to loopback addresses, but only on a kernel that mediates socket addresses (`/sys/kernel/security/apparmor/features/network_v9/af_inet` exists). On other kernels the rules load as plain TCP permission and `run.sh` prints a warning.
 
 `./run.sh --unconfined` skips all of it. To remove the profile: `sudo apparmor_parser -R /etc/apparmor.d/llm-server && sudo rm /etc/apparmor.d/llm-server`.
 
