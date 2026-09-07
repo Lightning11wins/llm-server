@@ -49,14 +49,24 @@ confirm() {
 # everything under /etc/apparmor.d at boot, and a symlink there would let
 # anyone who can write to this directory author system-wide policy as root.
 #
-# Loaded before it is copied: a profile the parser rejects must not end up in
-# /etc/apparmor.d, where it would match $SRC and hide that the kernel still has
-# the previous version. The unprivileged -Q dry run catches most of that
-# before sudo is even asked for.
+# Copied first, then loaded from the copy, so the kernel and /etc/apparmor.d
+# hold the same bytes even if $SRC changes underneath. The copy is staged
+# under a dotfile name, which the parser skips when apparmor.service loads the
+# directory at boot, and moved into place only once the parser has accepted
+# it: a rejected profile must not end up matching $SRC, which would hide that
+# the kernel still has the previous version. The unprivileged -Q dry run
+# catches most of that before sudo is even asked for.
 install_profile() {
+	local staged
+	staged=$(dirname "$INSTALLED")/.$PROFILE.new
 	apparmor_parser -Q --skip-cache "$SRC" || return 1
-	sudo apparmor_parser -r --skip-cache "$SRC" \
-		&& sudo install -m 0644 -o root -g root "$SRC" "$INSTALLED"
+	sudo install -m 0644 -o root -g root "$SRC" "$staged" || return 1
+	if sudo apparmor_parser -r --skip-cache "$staged"; then
+		sudo mv "$staged" "$INSTALLED"
+	else
+		sudo rm -f "$staged"
+		return 1
+	fi
 }
 
 # The label the kernel gives a process entered into the profile, with its mode:
@@ -121,7 +131,10 @@ elif [ -L "$INSTALLED" ]; then
 	# Left by an earlier run.sh that symlinked instead of copying.
 	reason="$INSTALLED is a symlink rather than a root-owned copy"
 elif ! cmp -s "$SRC" "$INSTALLED"; then
-	reason="$INSTALLED does not match $SRC"
+	# Show what is about to be loaded as system policy. $SRC is writable by
+	# this user, so an edit here is the one place a change can slip in.
+	diff -u "$INSTALLED" "$SRC" >&2
+	reason="$INSTALLED does not match $SRC (diff above)"
 fi
 if [ -n "$reason" ]; then
 	confirm "$reason. Install it to $INSTALLED and load it (needs sudo)?" \
