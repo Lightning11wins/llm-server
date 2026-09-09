@@ -8,8 +8,13 @@ model.json:
         "backend": "llama-cpp",
         "model": "Qwen3.5-9B-Q4_K_M.gguf",        # GGUF file inside the model dir (required)
         "args": ["-ngl", "99", "-c", "32768"],   # extra llama-server flags (optional)
-        "startup_timeout": 300                   # seconds to wait for the model to load (optional)
+        "startup_timeout": 300,                  # seconds to wait for the model to load (optional)
+        "template_defaults": {"enable_thinking": false}   # chat template arguments (optional)
     }
+
+Raw prompts go to llama-server's `/completion`; chat requests (messages) go to its
+`/v1/chat/completions`, which applies the GGUF's embedded jinja chat template and
+parses reasoning and tool calls out of the output.
 
 Subprocess output is written to logs/llama-<model>-<timestamp>.log.
 """
@@ -24,7 +29,7 @@ from typing import IO, Any, Iterator
 
 import requests
 
-from . import Backend, GenParams, ModelConfigError
+from . import Backend, GenEvent, GenParams, Message, ModelConfigError, TemplateError
 
 BASE_DIR         = Path(__file__).parent.parent
 LLAMA_SERVER_BIN = BASE_DIR / "bin" / "llama.cpp" / "llama-server"
@@ -36,10 +41,14 @@ SHUTDOWN_GRACE          = 10    # seconds between SIGTERM and SIGKILL
 SSE_PING_INTERVAL       = 15    # seconds; llama-server emits SSE comments at this rate while silent (e.g. prompt processing)
 READ_TIMEOUT            = 60    # seconds without any bytes (token or ping) before the stream is considered dead
 
-# Flags model.json may not set: the server chooses the model file and binding itself, and an API key
-# would make its own proxied requests fail.
+# Flags model.json may not set: the server chooses the model file and binding itself, an API key
+# would make its own proxied requests fail, and chat mode depends on the jinja template engine.
 RESERVED_ARGS = {"-m", "--model", "-mu", "--model-url", "-hf", "--hf-repo", "--host", "--port",
-				 "--no-webui", "--webui", "--api-key"}
+				 "--no-webui", "--webui", "--api-key", "--jinja", "--no-jinja"}
+
+# llama-server's stop_type (raw completion) and finish_reason (chat) mapped onto our stop_reason.
+COMPLETION_STOP_REASONS = {"eos": "eos", "limit": "length", "word": "stop"}
+CHAT_STOP_REASONS       = {"stop": "eos", "length": "length", "tool_calls": "tool"}
 
 _prctl = ctypes.CDLL(None, use_errno=True).prctl  # resolved at import so the forked child makes a single C call
 PR_SET_PDEATHSIG = 1
@@ -66,6 +75,7 @@ class LlamaCppBackend(Backend):
 	log_file: IO[bytes] | None = None
 	log_path: Path | None = None
 	port: int = 0
+	n_ctx: int | None = None
 
 	def __init__(self, name: str, model_dir: Path, config: dict[str, Any]) -> None:
 		super().__init__(name, model_dir, config)
@@ -109,6 +119,7 @@ class LlamaCppBackend(Backend):
 			"--host", "127.0.0.1",
 			"--port", str(self.port),
 			"--no-webui",
+			"--jinja",
 			*self.args,
 		]
 		self.proc = subprocess.Popen(
@@ -124,6 +135,7 @@ class LlamaCppBackend(Backend):
 				raise RuntimeError(f"llama-server exited with code {self.proc.returncode} during load. {self._log_tail()}")
 			try:
 				if requests.get(f"{self.base_url}/health", timeout=2).ok:
+					self.n_ctx = self._read_n_ctx()
 					return
 			except requests.RequestException:
 				pass
@@ -158,31 +170,141 @@ class LlamaCppBackend(Backend):
 		tail = self.log_path.read_text(errors="replace").splitlines()[-lines:]
 		return f"See {self.log_path.name}:\n" + "\n".join(tail)
 
-	def generate(self, params: GenParams) -> Iterator[str]:
+	# Per-slot context size, as llama-server reports it (n_ctx divided over the parallel slots).
+	def _read_n_ctx(self) -> int | None:
+		try:
+			props = requests.get(f"{self.base_url}/props", timeout=5).json()
+			n_ctx = props["default_generation_settings"]["n_ctx"]
+		except (requests.RequestException, ValueError, KeyError, TypeError):
+			return None
+		return n_ctx if isinstance(n_ctx, int) else None
+
+	# Always true: a GGUF without an embedded template gets llama-server's ChatML fallback. /props
+	# reports that fallback as the model's template, so the two cases cannot be told apart here.
+	def has_chat_template(self) -> bool:
+		return True
+
+	def context_length(self) -> int | None:
+		return self.n_ctx
+
+	def render_template(self, messages: list[Message], tools: list[dict[str, Any]] | None, template_args: dict[str, Any]) -> str:
 		if not self.is_alive():
 			raise RuntimeError("llama-server subprocess is not running")
+		body: dict[str, Any] = {"messages": messages, "chat_template_kwargs": template_args}
+		if tools:
+			body["tools"] = tools
+		resp = requests.post(f"{self.base_url}/apply-template", json=body, timeout=(5, 30))
+		if resp.status_code == 400:
+			raise TemplateError(_error_message(resp))
+		if not resp.ok:
+			raise RuntimeError(f"llama-server returned HTTP {resp.status_code}: {resp.text[:500]}")
+		return resp.json()["prompt"]
 
-		body = {
+	def generate(self, params: GenParams) -> Iterator[GenEvent]:
+		if not self.is_alive():
+			raise RuntimeError("llama-server subprocess is not running")
+		if params.messages is not None:
+			yield from self._chat(params)
+		else:
+			yield from self._completion(params)
+
+	# Stream `data:` payloads from a llama-server SSE endpoint, raising on transport or server errors.
+	def _sse(self, path: str, body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+		body["stream"] = True
+		body["cache_prompt"] = True
+		body["sse_ping_interval"] = SSE_PING_INTERVAL  # keeps READ_TIMEOUT from firing during long prompt processing
+		with requests.post(f"{self.base_url}{path}", json=body, stream=True, timeout=(5, READ_TIMEOUT)) as resp:
+			if not resp.ok:
+				raise RuntimeError(f"llama-server returned HTTP {resp.status_code}: {_error_message(resp)}")
+			for raw in resp.iter_lines():
+				if not raw.startswith(b"data: "):
+					continue  # blank separators, SSE comments/pings
+				if raw == b"data: [DONE]":
+					return
+				event = json.loads(raw[6:])
+				if "error" in event:
+					err = event["error"]
+					raise RuntimeError(f"llama-server error: {err.get('message', err) if isinstance(err, dict) else err}")
+				yield event
+
+	def _usage(self, prompt_tokens: int | None, completion_tokens: int | None) -> GenEvent:
+		return {"usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+						  "context_length": self.n_ctx}}
+
+	def _completion(self, params: GenParams) -> Iterator[GenEvent]:
+		body: dict[str, Any] = {
 			"prompt": params.prompt,
 			"n_predict": params.max_tokens,
 			"temperature": params.temperature,
 			"top_p": params.top_p,
 			"repeat_penalty": params.repetition_penalty,
-			"stream": True,
-			"cache_prompt": True,
-			"sse_ping_interval": SSE_PING_INTERVAL,  # keeps READ_TIMEOUT from firing during long prompt processing
+			"stop": params.stop,
 		}
-		with requests.post(f"{self.base_url}/completion", json=body, stream=True, timeout=(5, READ_TIMEOUT)) as resp:
-			if not resp.ok:
-				raise RuntimeError(f"llama-server returned HTTP {resp.status_code}: {resp.text[:500]}")
-			for raw in resp.iter_lines():
-				if not raw.startswith(b"data: "):
-					continue  # blank separators, SSE comments/pings
-				event = json.loads(raw[6:])
-				if "error" in event:
-					raise RuntimeError(f"llama-server error: {event['error']}")
-				content = event.get("content", "")
-				if content:
-					yield content
-				if event.get("stop"):
-					break
+		for event in self._sse("/completion", body):
+			content = event.get("content", "")
+			if content:
+				yield {"token": content}
+			if event.get("stop"):
+				yield {"stop_reason": COMPLETION_STOP_REASONS.get(event.get("stop_type"), "eos")}
+				timings = event.get("timings", {})
+				prompt_n = timings.get("prompt_n")
+				if prompt_n is not None:
+					prompt_n += timings.get("cache_n", 0)  # prompt_n counts only the tokens not served from cache
+				yield self._usage(prompt_n, timings.get("predicted_n"))
+				return
+		raise RuntimeError("llama-server stream ended without a final event")
+
+	def _chat(self, params: GenParams) -> Iterator[GenEvent]:
+		body: dict[str, Any] = {
+			"messages": params.messages,
+			"chat_template_kwargs": params.template_args,
+			"max_tokens": params.max_tokens,
+			"temperature": params.temperature,
+			"top_p": params.top_p,
+			"repeat_penalty": params.repetition_penalty,
+			"stop": params.stop,
+			"stream_options": {"include_usage": True},
+		}
+		if params.tools:
+			body["tools"] = params.tools
+
+		finish_reason: str | None = None
+		usage: dict[str, Any] = {}
+		tool_calls: dict[int, dict[str, Any]] = {}  # by index; arguments arrive as fragments
+		for event in self._sse("/v1/chat/completions", body):
+			if "usage" in event:
+				usage = event["usage"] or {}
+			for choice in event.get("choices", []):
+				delta = choice.get("delta", {})
+				if delta.get("reasoning_content"):
+					yield {"reasoning": delta["reasoning_content"]}
+				if delta.get("content"):
+					yield {"token": delta["content"]}
+				for call in delta.get("tool_calls", []):
+					acc = tool_calls.setdefault(call.get("index", len(tool_calls)),
+												{"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+					if call.get("id"):
+						acc["id"] = call["id"]
+					fn = call.get("function", {})
+					acc["function"]["name"] += fn.get("name") or ""
+					acc["function"]["arguments"] += fn.get("arguments") or ""
+				if choice.get("finish_reason"):
+					finish_reason = choice["finish_reason"]
+
+		if finish_reason is None:
+			raise RuntimeError("llama-server stream ended without a finish_reason")
+		# Tool calls cut off by max_tokens have truncated arguments; they are dropped rather than
+		# handed to a harness as if they were complete. The stop_reason "length" tells the story.
+		if finish_reason == "tool_calls" and tool_calls:
+			yield {"tool_calls": [tool_calls[i] for i in sorted(tool_calls)]}
+		yield {"stop_reason": CHAT_STOP_REASONS.get(finish_reason, "eos")}
+		yield self._usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+
+
+# Pull the human-readable message out of a llama-server error response.
+def _error_message(resp: requests.Response) -> str:
+	try:
+		err = resp.json()["error"]
+		return err["message"] if isinstance(err, dict) else str(err)
+	except (ValueError, KeyError, TypeError):
+		return resp.text[:500]
