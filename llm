@@ -231,7 +231,7 @@ def _print_error_body(raw: str):
 
 
 def _add_run_args(p: argparse.ArgumentParser) -> None:
-	p.add_argument("--model", required=True)
+	p.add_argument("model")
 	p.add_argument("--ttl", type=float, default=None)
 	p.add_argument("--autoload", action="store_true")
 	p.add_argument("--max-tokens", type=int, default=None, dest="max_tokens")
@@ -262,11 +262,11 @@ def main():
 	p_list.add_argument("--loaded", default="any", choices=["true", "false", "any"])
 
 	p_load = sub.add_parser("load")
-	p_load.add_argument("--model", required=True)
+	p_load.add_argument("model")
 	p_load.add_argument("--ttl", type=float, default=None)
 
 	p_unload = sub.add_parser("unload")
-	p_unload.add_argument("--model", required=True)
+	p_unload.add_argument("model")
 
 	p_run = sub.add_parser("run", help="raw completion of a prompt")
 	_add_run_args(p_run)
@@ -277,7 +277,7 @@ def main():
 	_add_chat_args(p_chat)
 
 	p_template = sub.add_parser("template", help="print the prompt a chat request renders to")
-	p_template.add_argument("--model", required=True)
+	p_template.add_argument("model")
 	p_template.add_argument("--ttl", type=float, default=None)
 	p_template.add_argument("--autoload", action="store_true")
 	_add_chat_args(p_template)
