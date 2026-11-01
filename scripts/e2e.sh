@@ -60,24 +60,24 @@ expect() {
 for m in "${MODELS[@]}"; do
 	echo "=== $m"
 	echo "--- load:"
-	./llm --port $PORT load --model "$m" --ttl $TTL || fail=1
+	./llm --port $PORT load "$m" --ttl $TTL || fail=1
 	echo "--- run:"
-	./llm --port $PORT run --model "$m" --ttl $TTL --prompt "The capital of France is" --max-tokens 24 --temperature 0.7 || fail=1
+	./llm --port $PORT run "$m" --ttl $TTL --prompt "The capital of France is" --max-tokens 24 --temperature 0.7 || fail=1
 	echo "--- run with stop (expect stop_reason: stop):"
-	expect "stop_reason: stop" ./llm --port $PORT run --model "$m" --ttl $TTL --prompt "1, 2, 3, 4," --max-tokens 40 --stop "," --temperature 0.3
+	expect "stop_reason: stop" ./llm --port $PORT run "$m" --ttl $TTL --prompt "1, 2, 3, 4," --max-tokens 40 --stop "," --temperature 0.3
 
 	# Chat mode: models without a chat template (gpt2) must be refused with a clear 400; the rest
 	# must answer, render their template and call a tool when asked to.
 	echo "--- template:"
 	tout="$(mktemp)"
-	if ./llm --port $PORT template --model "$m" --ttl $TTL --system "Be brief." --user "Hi" --no-thinking > "$tout" 2>&1; then
+	if ./llm --port $PORT template "$m" --ttl $TTL --system "Be brief." --user "Hi" --no-thinking > "$tout" 2>&1; then
 		cat "$tout"; echo
 		echo "--- chat:"
-		./llm --port $PORT chat --model "$m" --ttl $TTL --system "Answer in one word." --user "What is the capital of France?" --no-thinking --max-tokens 24 --temperature 0.7 || fail=1
+		./llm --port $PORT chat "$m" --ttl $TTL --system "Answer in one word." --user "What is the capital of France?" --no-thinking --max-tokens 24 --temperature 0.7 || fail=1
 		echo "--- chat with thinking (expect a reasoning event):"
-		expect '"reasoning"' ./llm --port $PORT chat --model "$m" --ttl $TTL --user "What is 2+2? Just the number." --max-tokens 400 --json
+		expect '"reasoning"' ./llm --port $PORT chat "$m" --ttl $TTL --user "What is 2+2? Just the number." --max-tokens 400 --json
 		echo "--- tool call (expect tool_calls and stop_reason tool):"
-		expect '"stop_reason": "tool"' ./llm --port $PORT chat --model "$m" --ttl $TTL --user "What is the weather in Paris? Use the tool." --tools "$TOOLS" --no-thinking --max-tokens 200 --json
+		expect '"stop_reason": "tool"' ./llm --port $PORT chat "$m" --ttl $TTL --user "What is the weather in Paris? Use the tool." --tools "$TOOLS" --no-thinking --max-tokens 200 --json
 	elif grep -q "has no chat template" "$tout"; then
 		echo "(no chat template; chat mode correctly refused)"
 	else
@@ -97,13 +97,13 @@ for m in "${MODELS[@]}"; do
 
 	# Unload mid-generation: the running request must be cancelled and the model released.
 	echo "--- unload during generation:"
-	./llm --port $PORT load --model "$m" --ttl 60 > /dev/null || fail=1
+	./llm --port $PORT load "$m" --ttl 60 > /dev/null || fail=1
 	rout="$(mktemp)"
-	./llm --port $PORT run --model "$m" --prompt "Write a long story about a robot." --max-tokens 4000 > "$rout" 2>&1 &
+	./llm --port $PORT run "$m" --prompt "Write a long story about a robot." --max-tokens 4000 > "$rout" 2>&1 &
 	rpid=$!
 	sleep 3
 	if kill -0 $rpid 2>/dev/null; then
-		./llm --port $PORT unload --model "$m" || fail=1
+		./llm --port $PORT unload "$m" || fail=1
 		if wait $rpid; then
 			echo "(generation finished just before the unload)"  # hit EOS in the gap; not a failure
 		elif ! grep -q "was unloaded; request cancelled" "$rout"; then
@@ -112,10 +112,10 @@ for m in "${MODELS[@]}"; do
 	else
 		# Nothing left to cancel: the model hit EOS first. Still check the unload itself.
 		echo "(generation finished before the unload)"
-		./llm --port $PORT unload --model "$m" || fail=1
+		./llm --port $PORT unload "$m" || fail=1
 	fi
 	./llm --port $PORT list --loaded true | grep -q '"name"' && { echo "STILL LOADED after unload"; fail=1; }
-	./llm --port $PORT unload --model "$m" || fail=1  # idempotent
+	./llm --port $PORT unload "$m" || fail=1  # idempotent
 	rm -f "$rout"
 	echo "--- nvidia-smi after unload:"
 	nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || true

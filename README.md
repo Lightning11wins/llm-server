@@ -247,12 +247,12 @@ Returns `{"prompt": "<|im_start|>system\n..."}`: the exact text a `/run` with th
 
 ```bash
 ./llm [--host <h>] [--port <p>] list [--loaded true|false|any]
-./llm load   --model <name> [--ttl <s>]
-./llm unload --model <name>
-./llm run    --model <name> --prompt <text> [<generation flags>]
-./llm chat   --model <name> [--system <text>] [--messages <file.json>] [--user <text>] \
+./llm load   <name> [--ttl <s>]
+./llm unload <name>
+./llm run    <name> --prompt <text> [<generation flags>]
+./llm chat   <name> [--system <text>] [--messages <file.json>] [--user <text>] \
              [--tools <file.json>] [--no-thinking] [--template-arg key=json ...] [<generation flags>]
-./llm template --model <name> [--system ...] [--messages ...] [--user ...] [--tools ...] \
+./llm template <name> [--system ...] [--messages ...] [--user ...] [--tools ...] \
              [--no-thinking] [--template-arg key=json ...] [--autoload --ttl <s>]
 
 # generation flags:
@@ -263,9 +263,9 @@ Returns `{"prompt": "<|im_start|>system\n..."}`: the exact text a `/run` with th
 `chat` builds the message list as `--system`, then the contents of `--messages` (a JSON list, e.g. a saved history), then `--user`. Answer text goes to stdout; thinking, `stop_reason` and `usage` go to stderr; tool calls are printed to stdout as JSON. `--json` prints every event as one JSON line instead. `--no-thinking` is shorthand for `--template-arg enable_thinking=false`. Template-arg values are JSON, so strings need quotes: `--template-arg 'reasoning_effort="low"'`.
 
 ```bash
-./llm chat --model qwen3.5-9b --autoload --ttl 600 --no-thinking --user "What is 2+2?"
-./llm chat --model qwen3.5-9b --tools tools.json --user "What is the weather in Paris?" --json
-./llm template --model qwen3.5-9b --system "Be brief." --user "Hi"
+./llm chat qwen3.5-9b --autoload --ttl 600 --no-thinking --user "What is 2+2?"
+./llm chat qwen3.5-9b --tools tools.json --user "What is the weather in Paris?" --json
+./llm template qwen3.5-9b --system "Be brief." --user "Hi"
 ```
 
 ## Testing
