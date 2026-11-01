@@ -21,7 +21,7 @@ from backends import Backend, GenParams, ModelConfigError, TemplateError, create
 HOST                    = "127.0.0.1"
 # HOST                  = "0.0.0.0"   # listen on every interface; also relax the
 #                                     # llm-server AppArmor profile's network rules
-PORT                    = 8080
+PORT                    = 8741
 DEFAULT_TTL             = 300
 DEFAULT_MAX_TOKENS      = 512
 DEFAULT_TEMPERATURE     = 1.0

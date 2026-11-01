@@ -111,7 +111,7 @@ Chat requests are rendered with the tokenizer's chat template. A model whose tok
 
 To start, simply run `./run.sh` in the project directory. This sets up the AppArmor profile and Python environment automatically, asking before anything that needs `sudo` or downloads packages.
 
-Binds `127.0.0.1:8080`. Change `HOST` and `PORT` at the top of `server.py`; `HOST = "0.0.0.0"` is there commented out for serving other machines, which also needs a one-line profile change. Logs are written to `logs/<timestamp>.log`.
+Binds `127.0.0.1:8741`. Change `HOST` and `PORT` at the top of `server.py`; `HOST = "0.0.0.0"` is there commented out for serving other machines, which also needs a one-line profile change. Logs are written to `logs/<timestamp>.log`.
 
 ## AppArmor
 
@@ -259,6 +259,8 @@ Returns `{"prompt": "<|im_start|>system\n..."}`: the exact text a `/run` with th
   [--autoload --ttl <s>] [--max-tokens <n>] [--temperature <f>] [--top-p <f>] [--repetition-penalty <f>]
   [--stop <text> ...] [--json]
 ```
+
+`--host` and `--port` default to `$LLM_HOST` and `$LLM_PORT`, or `localhost:8741`.
 
 `chat` builds the message list as `--system`, then the contents of `--messages` (a JSON list, e.g. a saved history), then `--user`. Answer text goes to stdout; thinking, `stop_reason` and `usage` go to stderr; tool calls are printed to stdout as JSON. `--json` prints every event as one JSON line instead. `--no-thinking` is shorthand for `--template-arg enable_thinking=false`. Template-arg values are JSON, so strings need quotes: `--template-arg 'reasoning_effort="low"'`.
 
