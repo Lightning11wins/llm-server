@@ -15,6 +15,7 @@ export PYTHONDONTWRITEBYTECODE=1
 export CUDA_CACHE_PATH="$TMPDIR/cuda-cache"
 
 PORT=8098
+export LLM_HOST=127.0.0.1  # the server under test, not the caller's
 TTL=2  # eviction monitor polls every 5s, so waits below are TTL + 6
 LOG="$(mktemp)"
 MODELS=("$@")
