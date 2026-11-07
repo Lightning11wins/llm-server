@@ -170,7 +170,7 @@ class LlamaCppBackend(Backend):
 		tail = self.log_path.read_text(errors="replace").splitlines()[-lines:]
 		return f"See {self.log_path.name}:\n" + "\n".join(tail)
 
-	# Per-slot context size, as llama-server reports it (n_ctx divided over the parallel slots).
+	# Per-slot context size, as llama-server reports it.
 	def _read_n_ctx(self) -> int | None:
 		try:
 			props = requests.get(f"{self.base_url}/props", timeout=5).json()

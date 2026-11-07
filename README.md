@@ -23,26 +23,26 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA 12
 
 The server expects `bin/llama.cpp/llama-server`. `bin/` is gitignored.
 
-**CUDA build (recommended on NVIDIA).** There is no prebuilt Linux CUDA release, so build it. Needs the CUDA toolkit (from NVIDIA's apt repo; the distro's 12.0 package does not support gcc 13), `cmake` and `libcurl4-openssl-dev`:
+**CUDA build (recommended on NVIDIA).** Build from source: the prebuilt CUDA releases lack flash-attention kernels for mixed KV cache types and are not tuned to the local CPU, which runs the MoE experts. Needs the CUDA toolkit (from NVIDIA's apt repo; the distro's 12.0 package does not support gcc 13) and `cmake`:
 
 ```bash
-git clone --depth 1 --branch b10819 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp-src
+git clone --depth 1 --branch b12190 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp-src
 cd /tmp/llama.cpp-src
 export PATH=/usr/local/cuda/bin:$PATH
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Release \
+cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA_QUANTS=all -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Release \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
       -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON -DCMAKE_BUILD_RPATH=/usr/local/cuda/lib64
 cmake --build build --config Release -j 12 --target llama-server llama-cli llama-bench
 mkdir -p <repo>/bin/llama.cpp && cp build/bin/* <repo>/bin/llama.cpp/
 ```
 
-`CMAKE_CUDA_ARCHITECTURES=89` is the RTX 4060 (Ada); change it for other GPUs. The two RPATH flags make the binaries find their own `.so` files and the CUDA runtime from any location.
+`CMAKE_CUDA_ARCHITECTURES=89` is the RTX 4060 (Ada); change it for other GPUs. `GGML_CUDA_FA_QUANTS=all` compiles flash attention for every K/V cache type pair; without it, a pair such as `-ctk q8_0 -ctv q4_0` silently runs attention on the CPU. The two RPATH flags make the binaries find their own `.so` files and the CUDA runtime from any location.
 
 **Vulkan prebuilt (no toolchain needed, slower prompt processing).**
 
 ```bash
 mkdir -p bin && cd bin
-curl -L -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b10819/llama-b10819-bin-ubuntu-vulkan-x64.tar.gz
+curl -L -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b12190/llama-b12190-bin-ubuntu-vulkan-x64.tar.gz
 tar xzf llama.tar.gz && rm llama.tar.gz && mv llama-b* llama.cpp
 ```
 
@@ -58,13 +58,13 @@ Every model directory **must** contain a `model.json` naming its backend. Direct
 {
   "backend": "llama-cpp",
   "model": "Qwen3.5-9B-Q4_K_M.gguf",
-  "args": ["-ngl", "99", "-c", "8192", "-fa", "on"],
+  "args": ["-ngl", "99", "-c", "131072", "-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "-np", "1"],
   "startup_timeout": 300
 }
 ```
 
 - `model` (required): GGUF filename inside the model directory.
-- `args` (optional): extra `llama-server` flags. The server always sets `-m`, `--host 127.0.0.1`, `--port <free port>`, `--no-webui` and `--jinja`, and rejects configs that try to override them. Run `bin/llama.cpp/llama-server --help` for the full list. Useful ones: `-ngl N` (layers on GPU), `-c N` (context size), `-fa on` (flash attention), `--n-cpu-moe N` (keep the first N layers' MoE experts in CPU RAM), `-ctk q8_0 -ctv q8_0` (quantized KV cache), `--fit on` (auto-tune to fit device memory), `--reasoning-budget N` (cap thinking tokens).
+- `args` (optional): extra `llama-server` flags. The server always sets `-m`, `--host 127.0.0.1`, `--port <free port>`, `--no-webui` and `--jinja`, and rejects configs that try to override them. Run `bin/llama.cpp/llama-server --help` for the full list. Useful ones: `-ngl N` (layers on GPU), `-c N` (context size), `-fa on` (flash attention), `--n-cpu-moe N` (keep the first N layers' MoE experts in CPU RAM), `-ctk q8_0 -ctv q8_0` (quantized KV cache), `-np 1` (one slot; the server queues requests per model anyway), `-ub N -b N` (prompt batch size), `--fit on` (auto-tune to fit device memory), `--reasoning-budget N` (cap thinking tokens).
 - `startup_timeout` (optional, seconds): how long to wait for the model to load. Default 300.
 - `template_defaults` (optional, any backend): chat-template arguments applied to every chat request unless the request's `template_args` overrides them, e.g. `{"enable_thinking": false}` to make a Qwen model answer without thinking by default.
 
@@ -83,19 +83,28 @@ rm -rf models/qwen3.5-9b/.cache
 Test a GGUF directly, without the server, to tune flags. It prints VRAM use plus short- and long-prompt speeds:
 
 ```bash
-scripts/smoke_llama.sh models/qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf -ngl 99 -c 8192 -fa on
+scripts/smoke_llama.sh models/qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf -ngl 99 -c 131072 -fa on -ctk q4_0 -ctv q4_0 -np 1
 ```
 
-#### Tuning notes (RTX 4060 8 GB, 30 GB RAM, CUDA build b10819)
+While a long prompt is processing, `nvidia-smi` should show the GPU near 100% and `llama-server` using about one core. A low GPU figure with several busy cores means part of the work fell back to the CPU.
 
-| Model | Flags | VRAM | Prompt | Generation |
+#### Tuning notes (RTX 4060 8 GB, 30 GB RAM, CUDA build b12190)
+
+Every model runs a 128k context with `-ngl 99 -c 131072 -fa on -np 1` plus the flags below. Prompt and generation speeds are for a 1.4k-token prompt and a 123k-token prompt. VRAM is the peak during the 123k prompt, including about 0.5 GB used by the desktop.
+
+| Model | Extra flags | VRAM | Prompt 1.4k / 123k | Generation 1.4k / 123k |
 |---|---|---|---|---|
-| Qwen3.5-9B Q4_K_M | `-ngl 99 -c 8192 -fa on` | 5.9 GB | ~94 tok/s* | 44 tok/s |
-| Qwen3.6-35B-A3B UD-Q4_K_XL | `-ngl 99 --n-cpu-moe 34 -c 32768 -fa on -ctk q8_0 -ctv q8_0 --load-mode none` | 6.7 GB | 533 tok/s | 44 tok/s |
+| Qwen3.5-2B Q8_0 | none | 4.3 GB | 8900 / 5100 tok/s | 103 / 61 tok/s |
+| Qwen3.5-9B Q4_K_M | `-ctk q4_0 -ctv q4_0` | 7.4 GB | 2060 / 1390 tok/s | 43 / 26 tok/s |
+| Qwen3.6-35B-A3B UD-Q4_K_XL | `--n-cpu-moe 36 -ctk q8_0 -ctv q8_0 -ub 2048 -b 2048 --load-mode none` | 7.3 GB | 1040 / 1050 tok/s | 42 / 24 tok/s |
 
-\* measured on a 5-token prompt, so not meaningful; the 35B figure is from a 1442-token prompt.
+All three recall a fact placed at the start of the 123k-token prompt.
 
-For the MoE model: `--n-cpu-moe N` keeps the experts of the first N of 40 layers in system RAM (~0.5 GB per layer at this quant), and `--load-mode none` disables mmap, which the loader recommends when experts are on CPU. All 40 layers on CPU used 3.6 GB VRAM at 24 tok/s; 34 gives 44 tok/s; 33 gave no further gain and left under 1 GB free. Leave `-ngl 99` set explicitly, otherwise the `--fit` heuristic may pick a different split.
+`-np 1` matters at this size. By default `llama-server` opens 4 slots that share one KV cache, and each extra slot costs VRAM for the model's recurrent state.
+
+The 9B's KV cache takes 4 GB at f16 and does not fit with q8_0 either, so it runs q4_0 for both K and V.
+
+For the MoE model, `--n-cpu-moe N` keeps the experts of the first N of 40 layers in system RAM (~0.5 GB per layer at this quant), and `--load-mode none` disables mmap, which the loader recommends when experts are on CPU. Generation speed is flat between 34 and 36 layers on CPU (41 to 44 tok/s), so 36 frees VRAM for `-ub 2048`, which takes 123k-token prompt processing from 580 to 1050 tok/s. 34 layers with `-ub 2048`, or 36 with `-ub 4096`, run out of VRAM. Leave `-ngl 99` set explicitly, otherwise the `--fit` heuristic may pick a different split.
 
 ### transformers
 
@@ -132,10 +141,10 @@ GET /list?loaded=any|true|false
 ```
 
 ```json
-[{"name": "qwen3.5-9b", "loaded": true, "context_length": 8192}, ...]
+[{"name": "qwen3.5-9b", "loaded": true, "context_length": 131072}, ...]
 ```
 
-`context_length` is the total number of tokens (prompt plus completion) the loaded model accepts; `null` when the model is not loaded. For `llama-cpp` it is the per-slot context (`-c` divided by the number of parallel slots).
+`context_length` is the total number of tokens (prompt plus completion) the loaded model accepts; `null` when the model is not loaded. For `llama-cpp` it is the per-slot context, which is the full `-c` while the slots share one KV cache (the default).
 
 ### POST /load
 
@@ -145,7 +154,7 @@ GET /list?loaded=any|true|false
 
 Blocks until loaded. If already loaded, refreshes TTL. `ttl` (seconds) defaults to 300.
 
-Returns `{"status": "loaded", "model": "qwen3.5-9b", "context_length": 8192}`. Returns HTTP 409 if the model is unloaded while this load is in flight.
+Returns `{"status": "loaded", "model": "qwen3.5-9b", "context_length": 131072}`. Returns HTTP 409 if the model is unloaded while this load is in flight.
 
 ### POST /unload
 
@@ -218,7 +227,7 @@ data: {"reasoning": "The user wants"}        model's thinking, chat mode only, w
 data: {"token": "Hello"}                     answer text
 data: {"tool_calls": [{"id": "...", "type": "function", "function": {"name": "run_shell", "arguments": "{\"command\":\"df -h\"}"}}]}
 data: {"stop_reason": "eos"}                 eos | length | stop | tool
-data: {"usage": {"prompt_tokens": 281, "completion_tokens": 26, "context_length": 8192}}
+data: {"usage": {"prompt_tokens": 281, "completion_tokens": 26, "context_length": 131072}}
 data: [DONE]
 ```
 
